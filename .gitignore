@@ -1,3 +1,8 @@
+.opencode
+openspec
+docs
+tmp
+
 node_modules/
 __pycache__/
 *.pyc

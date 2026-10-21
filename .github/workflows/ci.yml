@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install root dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Install bridge dependencies
+        run: npm ci --prefix bridge --no-audit --no-fund
+
+      - name: Run bridge tests
+        run: npm --prefix bridge test
+
+      - name: Install Python test dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run adapter tests
+        run: python -m pytest tests/ -q
+
+      - name: Validate OpenSpec change
+        run: |
+          if command -v openspec >/dev/null 2>&1; then
+            openspec validate make-keet-channel-interoperable --strict
+          else
+            echo "openspec CLI is not installed; skipping validation"
+          fi

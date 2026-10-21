@@ -1,25 +1,25 @@
-name: keet-platform
+name: keet-channel
 label: Keet
 kind: platform
-version: 0.1.0
+version: 0.4.0
 description: >
   Keet P2P messenger gateway adapter for Hermes Agent.
   Connects to a local Keet Bridge daemon via stdio JSON protocol.
   Bridge runs as a plain Node.js subprocess — auto-detected,
-  auto-started, no manual config needed.
+  auto-started, no manual config needed. Access is denied by default.
 author: migunov
 optional_env:
   - name: KEET_ALLOWED_USERS
-    description: "Comma-separated Keet contact public keys allowed to interact"
-    prompt: "Allowed contact keys (comma-separated)"
+    description: "Comma-separated 64-hex Keet identity public keys allowed to interact. Unset means deny by default."
+    prompt: "Allowed identity keys (comma-separated, 64 hex each)"
     password: false
   - name: KEET_ALLOW_ALL_USERS
-    description: "Allow any contact to interact (dev only)"
-    prompt: "Allow all contacts? (true/false)"
+    description: "Development-only override: the literal value true admits every identity. Not persisted."
+    prompt: "Allow all identities? (true/false; development only)"
     password: false
   - name: KEET_HOME_CHANNEL
-    description: "Default chat for cron/notification delivery (room key in hex)"
-    prompt: "Home channel room key (hex)"
+    description: "Default room for cron/notification delivery, addressed by its stable 64-hex room key"
+    prompt: "Home channel room key (64 hex)"
     password: false
   - name: KEET_HOME_CHANNEL_NAME
     description: "Human label for the home channel"

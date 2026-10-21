@@ -1,302 +1,946 @@
+'use strict'
+
+const path = require('node:path')
+const fs = require('node:fs')
+const { EventEmitter } = require('node:events')
+
 const b4a = require('b4a')
+const BlindPairing = require('blind-pairing')
 const crypto = require('hypercore-crypto')
-const c = require('compact-encoding')
-const sodium = require('sodium-universal')
-const blind = require('blind-pairing-core')
-const Hyperswarm = require('hyperswarm')
-const z32 = require('z32')
 
-const { CandidateRequest, MemberRequest, createInvite, decodeInvite } = blind
+const { createInvite, decodeInviteUrl } = require('./invite')
+const {
+  StorageError,
+  dataPaths,
+  ensureMode,
+  readJsonFile,
+  writeJsonAtomic
+} = require('./identity')
+const { createErrorClass } = require('./errors')
+const { KEY_BYTES, isKeyHex, normalizeKey } = require('./keys')
 
-const DEFAULT_TTL = 72 * 60 * 60 * 1000 // 72 hours
+const PAIRING_VERSION = 1
+const USER_DATA_VERSION = 1
+const ALLOWLIST_VERSION = 1
+const MAX_USER_DATA_BYTES = 1024
+const MAX_DISPLAY_NAME_BYTES = 256
+const DEFAULT_PENDING_TIMEOUT_MS = 5 * 60 * 1000
+const DEFAULT_JOIN_TIMEOUT_MS = 60 * 1000
+const DEFAULT_CHECK_INTERVAL_MS = 1000
+const MAX_PAIRING_HISTORY = 200
 
-/**
- * Wrap a standard blind-pairing invite into the Keet-compatible format.
- * Keet mobile app expects flags=97 (bits 0, 5, 6) and a 33-byte
- * extension: c.uint(148) prefix + 32-byte encryption key.
- */
-function wrapKeetInvite(invite, encKey) {
-  // invite.invite is the standard 66-byte Invite buffer (version+flags+seed+discoveryKey)
-  const base = invite.invite
-  // New buffer: 66 (base) + 33 (extension) = 99 bytes
-  const keetBuf = b4a.alloc(99)
-  b4a.copy(base, keetBuf, 0, 0, base.length)
+const PairingError = createErrorClass('PairingError')
 
-  // Set flags byte to 97 (bits 0, 5, 6 set)
-  // In compact-encoding, c.uint(97) = 0x61
-  keetBuf[1] = 97
-
-  // Append extension: c.uint(148) + fixed32(encKey) = 1 + 32 = 33 bytes
-  keetBuf[66] = 148
-  keetBuf.set(encKey, 67)
-
-  return { ...invite, invite: keetBuf }
+function toKey (value, field) {
+  return normalizeKey(value, field, PairingError)
 }
 
-class PairingManager {
-  constructor(dht, bridge) {
-    this.dht = dht
-    this.bridge = bridge
-    this.sessions = new Map()     // ticket hex → InviteSession
-    this.pending = new Map()      // candidateId → { req, noiseSocket, ticket }
-    this._servers = new Map()     // ticket hex → dht server (one per invite)
+function normalizeDisplayName (value) {
+  if (value === undefined || value === null) return ''
+  if (typeof value !== 'string') {
+    throw new PairingError('INVALID_DISPLAY_NAME', 'displayName must be a string')
+  }
+  if (b4a.byteLength(value, 'utf-8') > MAX_DISPLAY_NAME_BYTES) {
+    throw new PairingError(
+      'INVALID_DISPLAY_NAME',
+      `displayName must be at most ${MAX_DISPLAY_NAME_BYTES} UTF-8 bytes`
+    )
+  }
+  return value
+}
+
+function encodeUserData (fields) {
+  if (!fields || typeof fields !== 'object') {
+    throw new PairingError('INVALID_USER_DATA', 'user data fields must be an object')
   }
 
-  /**
-   * Create an invite for a given topic key.
-   */
-  async createInvite(topicKey, opts = {}) {
-    const ttl = opts.ttl || DEFAULT_TTL
-    const expires = Date.now() + ttl
+  const value = {
+    version: USER_DATA_VERSION,
+    identityKey: toKey(fields.identityKey, 'identityKey').toString('hex'),
+    writerKey: toKey(fields.writerKey, 'writerKey').toString('hex')
+  }
+  const displayName = normalizeDisplayName(fields.displayName)
 
-    // Ensure the room exists
-    let room = this.bridge.rooms.get(b4a.toString(topicKey, 'hex'))
-    if (!room) {
-      room = await this.bridge.createRoom(topicKey)
+  if (displayName !== '') value.displayName = displayName
+
+  const buffer = b4a.from(JSON.stringify(value), 'utf-8')
+
+  if (buffer.byteLength > MAX_USER_DATA_BYTES) {
+    throw new PairingError(
+      'USER_DATA_TOO_LARGE',
+      `user data must be at most ${MAX_USER_DATA_BYTES} bytes`
+    )
+  }
+
+  return buffer
+}
+
+function decodeUserData (buffer) {
+  if (!b4a.isBuffer(buffer) && !(buffer instanceof Uint8Array)) {
+    throw new PairingError('INVALID_USER_DATA', 'user data must be a buffer')
+  }
+  if (buffer.byteLength === 0 || buffer.byteLength > MAX_USER_DATA_BYTES) {
+    throw new PairingError('INVALID_USER_DATA', 'user data has an invalid length')
+  }
+
+  let value
+
+  try {
+    value = JSON.parse(b4a.toString(buffer, 'utf-8'))
+  } catch {
+    throw new PairingError('INVALID_USER_DATA', 'user data is not valid JSON')
+  }
+
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new PairingError('INVALID_USER_DATA', 'user data must be a JSON object')
+  }
+  if (value.version !== USER_DATA_VERSION) {
+    throw new PairingError('INVALID_USER_DATA', 'user data has an unsupported version')
+  }
+  if (!isKeyHex(value.identityKey)) {
+    throw new PairingError('INVALID_USER_DATA', 'user data identityKey is invalid')
+  }
+  if (!isKeyHex(value.writerKey)) {
+    throw new PairingError('INVALID_USER_DATA', 'user data writerKey is invalid')
+  }
+
+  let displayName
+
+  try {
+    displayName = normalizeDisplayName(value.displayName)
+  } catch (err) {
+    throw new PairingError('INVALID_USER_DATA', `user data ${err.message}`)
+  }
+
+  return {
+    version: USER_DATA_VERSION,
+    identityKey: value.identityKey,
+    identityKeyHex: value.identityKey,
+    writerKey: value.writerKey,
+    writerKeyHex: value.writerKey,
+    displayName
+  }
+}
+
+// Accepts a comma-separated list, trims and lowercases entries, and reports
+// invalid entries instead of silently granting them.
+function parseAllowedUsers (value) {
+  if (value === undefined || value === null) return { identities: [], invalid: [] }
+  if (typeof value !== 'string') {
+    return { identities: [], invalid: [String(value)] }
+  }
+
+  const identities = []
+  const invalid = []
+
+  for (const entry of value.split(',')) {
+    const normalized = entry.trim().toLowerCase()
+
+    if (normalized === '') continue
+    if (!isKeyHex(normalized)) {
+      invalid.push(entry.trim())
+      continue
+    }
+    if (!identities.includes(normalized)) identities.push(normalized)
+  }
+
+  return { identities, invalid }
+}
+
+function resolveAclFile (opts = {}) {
+  if (opts.aclFile) return path.resolve(opts.aclFile)
+  if (opts.env && opts.env.KEET_ACL_FILE) return path.resolve(opts.env.KEET_ACL_FILE)
+  if (opts.dataDir) return dataPaths(path.resolve(opts.dataDir)).allowedFile
+  return null
+}
+
+function normalizeAllowlist (value, file) {
+  const records = Array.isArray(value)
+    ? value
+    : value && typeof value === 'object' && Array.isArray(value.identities)
+      ? value.identities
+      : null
+
+  if (records === null) {
+    throw new StorageError(
+      'INVALID_ALLOWLIST',
+      `Invalid allowlist at ${file}: expected an identities array`
+    )
+  }
+
+  const identities = []
+
+  for (const record of records) {
+    if (isKeyHex(record) && !identities.includes(record)) identities.push(record)
+  }
+
+  return identities
+}
+
+function loadAllowedIdentities (opts = {}) {
+  const file = resolveAclFile(opts)
+
+  if (file === null) return []
+
+  let value
+
+  try {
+    value = readJsonFile(file, 'allowlist')
+  } catch (err) {
+    if (err.code === 'ENOENT') return []
+    throw err
+  }
+
+  return normalizeAllowlist(value, file)
+}
+
+function saveAllowedIdentities (identities, opts = {}) {
+  const file = resolveAclFile(opts)
+
+  if (file === null) {
+    throw new PairingError('ACL_FILE_REQUIRED', 'an allowlist file path or data directory is required')
+  }
+
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+
+  const current = loadAllowedIdentities({ aclFile: file })
+  const merged = [...current]
+
+  for (const identity of identities) {
+    const hex = toKey(identity, 'identityKey').toString('hex')
+    if (!merged.includes(hex)) merged.push(hex)
+  }
+
+  merged.sort()
+
+  writeJsonAtomic(file, { version: ALLOWLIST_VERSION, identities: merged })
+  ensureMode(file, 0o600)
+
+  return merged
+}
+
+function publicRequest (entry) {
+  return {
+    request_id: entry.requestId,
+    requestId: entry.requestId,
+    invitation_id: entry.invitationId,
+    identity: entry.identity,
+    writer_key: entry.writerKey,
+    display_name: entry.displayName,
+    created_at: entry.createdAt,
+    expires_at: entry.expiresAt,
+    status: entry.status
+  }
+}
+
+class Pairing extends EventEmitter {
+  constructor (opts = {}) {
+    super()
+
+    this.swarm = opts.swarm || null
+    this.identity = opts.identity || null
+    this.room = opts.room || null
+
+    const env = opts.env || process.env
+    this.env = env
+
+    this.dataDir = opts.dataDir
+      ? path.resolve(opts.dataDir)
+      : opts.room
+        ? path.resolve(opts.room.dataDir)
+        : null
+    this.aclFile = resolveAclFile({ dataDir: this.dataDir, aclFile: opts.aclFile, env })
+    this.allowAll =
+      opts.allowAll === undefined
+        ? env.KEET_ALLOW_ALL_USERS === 'true'
+        : opts.allowAll === true
+    this.pendingTimeoutMs = positiveInt(
+      opts.pendingTimeoutMs !== undefined ? opts.pendingTimeoutMs : env.KEET_PAIRING_TIMEOUT_MS,
+      DEFAULT_PENDING_TIMEOUT_MS
+    )
+    this.joinTimeoutMs = positiveInt(
+      opts.joinTimeoutMs !== undefined ? opts.joinTimeoutMs : env.KEET_PAIRING_JOIN_TIMEOUT_MS,
+      DEFAULT_JOIN_TIMEOUT_MS
+    )
+    this.checkIntervalMs = positiveInt(
+      opts.checkIntervalMs,
+      Math.max(10, Math.min(DEFAULT_CHECK_INTERVAL_MS, this.pendingTimeoutMs))
+    )
+    this.poll = opts.poll
+    this.format = opts.format
+    this.now = typeof opts.now === 'function' ? opts.now : Date.now
+    this.log =
+      typeof opts.log === 'function'
+        ? opts.log
+        : (message) => console.error(`[pairing] ${message}`)
+
+    this._blind = null
+    this._invites = new Map()
+    this._pending = new Map()
+    this._history = new Map()
+    this._timer = null
+    this._closed = false
+    this._allowAllWarned = false
+    this._allowed = new Set()
+    this._releasedCandidates = new WeakSet()
+
+    this._loadAllowed(opts.allowedUsers !== undefined ? opts.allowedUsers : env.KEET_ALLOWED_USERS)
+  }
+
+  get inviteUrl () {
+    for (const entry of this._invites.values()) return entry.invite.url
+    return null
+  }
+
+  get pendingCount () {
+    return this._pending.size
+  }
+
+  invites () {
+    return [...this._invites.values()].map((entry) => ({
+      invitationId: entry.invite.invitationId,
+      invitation_id: entry.invite.invitationId,
+      url: entry.invite.url,
+      room_key: entry.invite.roomKeyHex,
+      expires: entry.invite.expires,
+      format: entry.invite.format
+    }))
+  }
+
+  _loadAllowed (configured) {
+    const { identities, invalid } = parseAllowedUsers(configured)
+
+    for (const entry of invalid) {
+      this.log(`ignoring invalid KEET_ALLOWED_USERS entry: ${JSON.stringify(entry).slice(0, 80)}`)
     }
 
-    // Include the bridge's direct address as additionalNodes so the
-    // phone can connect directly via port 11000 (forwarded by Docker).
-    // This bypasses DHT discovery if the Keet app supports additionalNodes.
-    let additionalNodes = null
+    let persisted = []
+
     try {
-      const host = this.bridge.dht.host
-      if (host && host !== '0.0.0.0' && host !== '127.0.0.1') {
-        additionalNodes = [{ host, port: 11000 }]
-        console.error('[pairing] additionalNode: %s:%d', host, 11000)
+      persisted = loadAllowedIdentities({ aclFile: this.aclFile, dataDir: this.dataDir })
+    } catch (err) {
+      this.log(`could not load the persisted allowlist: ${err.message}`)
+    }
+
+    this._allowed = new Set([...persisted, ...identities])
+    return this._allowed
+  }
+
+  reloadAllowed () {
+    return this._loadAllowed(this.env.KEET_ALLOWED_USERS)
+  }
+
+  isAllowed (identityKey) {
+    return this._allowed.has(toKey(identityKey, 'identityKey').toString('hex'))
+  }
+
+  async start (opts = {}) {
+    if (this._closed) {
+      throw new PairingError('PAIRING_CLOSED', 'pairing has been closed')
+    }
+
+    if (this._blind === null) {
+      if (this.swarm === null) {
+        throw new PairingError('SWARM_REQUIRED', 'pairing requires a Hyperswarm instance')
       }
-    } catch (e) {
-      console.error('[pairing] additionalNode error:', e.message)
-    }
 
-    // Create the blind-pairing invite.
-    // The `key` here is the room topicKey; discoveryKey is derived from it.
-    const invite = createInvite(topicKey, {
-      discoveryKey: crypto.discoveryKey(topicKey),
-      additionalNodes
-    })
+      const blind = this._createBlindPairing()
 
-    // Generate encryption key for the room and wrap invite into Keet format
-    const encKey = crypto.randomBytes(32)
-    const keetInvite = wrapKeetInvite(invite, encKey)
-
-    const ticket = b4a.toString(invite.publicKey, 'hex')
-    const url = 'keet://chat/' + z32.encode(keetInvite.invite)
-    const dkHex = b4a.toString(invite.discoveryKey, 'hex')
-
-    // Store session
-    this.sessions.set(ticket, {
-      ticket,
-      invite,
-      topicKey,
-      roomKey: b4a.toString(topicKey, 'hex'),
-      encKey,                        // stored encryption key for confirm()
-      createdAt: Date.now(),
-      expires,
-      status: 'active'
-    })
-
-    // Start a Hyperswarm swarm for this invite that joins the
-    // discoveryKey topic. The phone's Keet app does the same:
-    // swarm.join(discoveryKey, { server: false }), and Hyperswarm
-    // connects them through DHT relay/holepunching.
-    const inviteKP = crypto.keyPair(invite.seed)
-    this._startServer(inviteKP, ticket, invite.discoveryKey)
-
-    return { url, ticket, roomKey: b4a.toString(topicKey, 'hex') }
-  }
-
-  /**
-   * Start listening for incoming candidate connections via DHT server.
-   *
-   * Creates a DHT server on the invite's seed keyPair for the
-   * blind-pairing Noise handshake. Announces the invite's discoveryKey
-   * pointing to the BRIDGE'S identity keyPair — not the invite seed
-   * keyPair — so the phone connects through the welcome room's already-
-   * established DHT relay connections.
-   */
-  async _startServer(keyPair, ticket, discoveryKey) {
-    // Create DHT server on invite seed keyPair for the Noise handshake
-    const server = this.dht.createServer()
-    server.on('connection', noiseSocket => {
-      const remoteKey = noiseSocket.remotePublicKey
-        ? b4a.toString(noiseSocket.remotePublicKey, 'hex').slice(0, 16)
-        : 'unknown'
-      console.error('[pairing] INCOMING CONNECTION ticket=%s remote=%s',
-        ticket.slice(0, 16), remoteKey)
-      noiseSocket.on('data', rawBuf => {
-        console.error('[pairing] DATA ticket=%s len=%d', ticket.slice(0, 16), rawBuf.length)
-        this._handleIncoming(rawBuf, noiseSocket, ticket)
-      })
-      noiseSocket.on('error', (err) => {
-        console.error('[pairing] conn error ticket=%s: %s', ticket.slice(0, 16), err.message)
-      })
-      noiseSocket.on('close', () => {
-        console.error('[pairing] conn CLOSED ticket=%s', ticket.slice(0, 16))
-      })
-    })
-
-    await server.listen(keyPair)
-    console.error('[pairing] Server listening on invite keyPair for ticket=%s', ticket.slice(0, 16))
-
-    // Announce discoveryKey pointing to the BRIDGE IDENTITY keyPair
-    // (not invite seed keyPair). This way the phone connects through
-    // the welcome room's DHT relay connections which are already
-    // established and findable.
-    try {
-      const identityKP = this.bridge.identity.keyPair
-      const announceStream = this.dht.announce(discoveryKey, identityKP)
-      server._announceStream = announceStream
-      announceStream.finished().catch(() => {})
-      console.error('[pairing] Announced discoveryKey → identity keyPair for ticket=%s',
-        ticket.slice(0, 16))
-    } catch (e) {
-      console.error('[pairing] Announce failed for ticket=%s: %s', ticket.slice(0, 16), e.message)
-    }
-
-    this._servers.set(ticket, server)
-  }
-
-  /**
-   * Handle incoming candidate data on the DHT noise pipe.
-   */
-  async _handleIncoming(rawBuf, noiseSocket, ticket) {
-    const session = this.sessions.get(ticket)
-    if (!session || session.status !== 'active') return
-
-    // Check expiry
-    if (session.expires && Date.now() > session.expires) {
-      console.error('[pairing] Expired invite (%s), denying', ticket.slice(0, 16))
-      session.status = 'expired'
-      // Send INVITE_EXPIRED (status: 3)
       try {
-        const req = MemberRequest.from(rawBuf)
-        req.deny({ status: 3 })
-        if (req.response) noiseSocket.write(req.response)
+        await blind.ready()
+      } catch (err) {
+        try {
+          await blind.close()
+        } catch (closeError) {
+          this.log(`failed to close blind pairing after a failed start: ${closeError.message}`)
+        }
+        throw err
+      }
+
+      this._blind = blind
+    }
+
+    if (this._timer === null) {
+      this._timer = setInterval(() => this._expirePending(), this.checkIntervalMs)
+      if (typeof this._timer.unref === 'function') this._timer.unref()
+    }
+
+    if (this.room !== null && this._invites.size === 0) {
+      return this.createInvite(opts)
+    }
+
+    return null
+  }
+
+  _createBlindPairing () {
+    return new BlindPairing(this.swarm, { poll: this.poll })
+  }
+
+  async createInvite (opts = {}) {
+    if (this._closed) {
+      throw new PairingError('PAIRING_CLOSED', 'pairing has been closed')
+    }
+    if (this.room === null) {
+      throw new PairingError('ROOM_REQUIRED', 'creating an invite requires a room')
+    }
+
+    if (this._blind === null) {
+      await this.start()
+    }
+
+    // blind-pairing allows one active member per discovery key.
+    await this.cancelInvite(undefined, 'replaced')
+
+    const invite = createInvite({
+      roomKey: this.room.key,
+      encryptionKey: this.room.encryptionKey,
+      expires: opts.expires,
+      format: opts.format === undefined ? this.format : opts.format,
+      seed: opts.seed,
+      sensitive: opts.sensitive,
+      testInvitation: opts.testInvitation,
+      additionalNodes: opts.additionalNodes
+    })
+
+    const member = this._blind.addMember({
+      discoveryKey: invite.discoveryKey,
+      onadd: (request) => this._onRequest(request, invite)
+    })
+
+    try {
+      await member.ready()
+    } catch (err) {
+      try {
+        await member.close()
+      } catch (closeError) {
+        this.log(`failed to close an invite listener after a failed start: ${closeError.message}`)
+      }
+      throw err
+    }
+
+    const entry = { invite, member }
+    this._invites.set(invite.invitationId, entry)
+
+    const result = {
+      invitationId: invite.invitationId,
+      invitation_id: invite.invitationId,
+      url: invite.url,
+      roomKey: invite.roomKeyHex,
+      room_key: invite.roomKeyHex,
+      discoveryKey: invite.discoveryKeyHex,
+      discovery_key: invite.discoveryKeyHex,
+      expires: invite.expires,
+      format: invite.format
+    }
+
+    this.emit('invite_created', result)
+
+    return result
+  }
+
+  async cancelInvite (invitationId, reason = 'cancelled') {
+    const entries = []
+
+    if (invitationId === undefined || invitationId === null) {
+      for (const entry of this._invites.values()) entries.push(entry)
+    } else {
+      const entry = this._invites.get(invitationId)
+      if (entry === undefined) {
+        throw new PairingError('UNKNOWN_INVITE', 'unknown invitation id')
+      }
+      entries.push(entry)
+    }
+
+    for (const entry of entries) {
+      this._invites.delete(entry.invite.invitationId)
+      let denied = 0
+
+      for (const pending of [...this._pending.values()]) {
+        if (pending.invitationId !== entry.invite.invitationId) continue
+        await this._settleDenied(pending, reason, 1)
+        denied++
+      }
+
+      // Let the denial responses reach the candidates before the member
+      // listener (and its channels) is torn down.
+      if (denied > 0) await delay(100)
+
+      try {
+        await entry.member.close()
+      } catch (err) {
+        this.log(`failed to close an invite listener: ${err.message}`)
+      }
+
+      this.emit('invite_cancelled', {
+        invitationId: entry.invite.invitationId,
+        invitation_id: entry.invite.invitationId,
+        reason
+      })
+    }
+
+    return entries.length
+  }
+
+  list () {
+    const records = []
+
+    for (const entry of this._pending.values()) records.push(publicRequest(entry))
+    for (const record of this._history.values()) records.push({ ...record })
+
+    return records
+  }
+
+  pending () {
+    return [...this._pending.values()].map(publicRequest)
+  }
+
+  async accept (requestId) {
+    const entry = this._pending.get(requestId)
+
+    if (entry === undefined) {
+      throw new PairingError('UNKNOWN_PAIRING_REQUEST', 'unknown or already resolved pairing request')
+    }
+
+    this._pending.delete(requestId)
+
+    let record
+
+    try {
+      record = await this._confirm(entry.request, entry, {
+        persist: true,
+        reason: 'accepted'
+      })
+    } finally {
+      entry.resolveDecision()
+    }
+
+    if (record.status !== 'accepted') {
+      throw new PairingError(
+        record.reason === 'not_writable' ? 'NOT_WRITABLE' : 'PAIRING_FAILED',
+        record.message || 'the candidate could not be confirmed'
+      )
+    }
+
+    return { ...record }
+  }
+
+  async decline (requestId) {
+    const entry = this._pending.get(requestId)
+
+    if (entry === undefined) {
+      throw new PairingError('UNKNOWN_PAIRING_REQUEST', 'unknown or already resolved pairing request')
+    }
+
+    return this._settleDenied(entry, 'declined', 1)
+  }
+
+  _recordHistory (record) {
+    this._history.set(record.requestId, record)
+
+    while (this._history.size > MAX_PAIRING_HISTORY) {
+      const oldest = this._history.keys().next().value
+      this._history.delete(oldest)
+    }
+  }
+
+  async _settleDenied (entry, reason, status) {
+    this._pending.delete(entry.requestId)
+
+    try {
+      entry.request.deny({ status })
+    } catch (err) {
+      this.log(`failed to deny a pairing request: ${err.message}`)
+    }
+
+    entry.resolveDecision()
+
+    const record = {
+      request_id: entry.requestId,
+      requestId: entry.requestId,
+      invitation_id: entry.invitationId,
+      identity: entry.identity,
+      writer_key: entry.writerKey,
+      display_name: entry.displayName,
+      status: reason === 'expired' ? 'expired' : reason === 'cancelled' ? 'cancelled' : 'declined',
+      reason,
+      resolved_at: this.now()
+    }
+
+    this._recordHistory(record)
+    this.emit(reason === 'expired' ? 'pairing_expired' : 'pairing_declined', record)
+
+    return { ...record }
+  }
+
+  async _onRequest (request, invite) {
+    let userData
+
+    if (!this._invites.has(invite.invitationId)) {
+      try {
+        request.deny({ status: 1 })
       } catch {}
-      noiseSocket.end()
       return
     }
 
     try {
-      const req = MemberRequest.from(rawBuf)
-      const userData = req.open(session.invite.publicKey)
-      const candidateId = b4a.toString(req.id, 'hex')
-      this.pending.set(candidateId, { req, noiseSocket, ticket })
+      request.open(invite.publicKey)
+      userData = decodeUserData(request.userData)
+    } catch (err) {
+      try {
+        request.deny({ status: 1 })
+      } catch {}
 
-      // Auto-accept by default
-      await this._autoAccept(candidateId, session, req, noiseSocket)
-    } catch (e) {
-      console.error('[pairing] Rejected for ticket %s: %s', ticket.slice(0, 16), e.message)
-    }
-  }
+      const rejection = {
+        reason: err.code || 'INVALID_USER_DATA',
+        message: err.message
+      }
 
-  /**
-   * Auto-accept a candidate: respond with room key and encryptionKey.
-   */
-  async _autoAccept(candidateId, session, req, noiseSocket) {
-    const roomKey = session.topicKey
-    const encryptionKey = session.encKey || crypto.randomBytes(32)
-
-    req.confirm({ key: roomKey, encryptionKey, additional: null })
-
-    if (req.response) {
-      noiseSocket.write(req.response)
+      this.log(`rejected a candidate: ${rejection.message}`)
+      this.emit('pairing_rejected', rejection)
+      return
     }
 
-    this.pending.delete(candidateId)
+    const entry = {
+      requestId: request.id.toString('hex'),
+      invitationId: invite.invitationId,
+      request,
+      identity: userData.identityKeyHex,
+      writerKey: userData.writerKeyHex,
+      displayName: userData.displayName,
+      createdAt: this.now(),
+      expiresAt: 0,
+      status: 'pending',
+      resolveDecision: null
+    }
 
-    this.bridge.stdio.send({
-      type: 'member_joined',
-      pubkey: b4a.toString(req.publicKey, 'hex'),
-      room_key: session.roomKey,
-      status: 'accepted'
-    })
-  }
+    const pendingExpiry = entry.createdAt + this.pendingTimeoutMs
+    const inviteExpiry = invite.expires === 0 ? Infinity : invite.expires
 
-  async acceptCandidate(candidateId) {
-    const pending = this.pending.get(candidateId)
-    if (!pending) return false
-    const { req, noiseSocket, ticket } = pending
-    const session = this.sessions.get(ticket)
-    if (!session) return false
-    await this._autoAccept(candidateId, session, req, noiseSocket)
-    return true
-  }
+    entry.expiresAt = Math.min(pendingExpiry, inviteExpiry)
 
-  async declineCandidate(candidateId) {
-    const pending = this.pending.get(candidateId)
-    if (!pending) return false
-    const { req, noiseSocket } = pending
-    req.deny({ status: 1 })
-    if (req.response) noiseSocket.write(req.response)
-    noiseSocket.end(b4a.from([]))
-    this.pending.delete(candidateId)
-    this.bridge.stdio.send({
-      type: 'pairing_result',
-      candidate_id: candidateId,
-      status: 'declined'
-    })
-    return true
-  }
-
-  getSessions() {
-    const now = Date.now()
-    const result = []
-    for (const [ticket, s] of this.sessions) {
-      result.push({
-        ticket,
-        room_key: s.roomKey,
-        status: s.status,
-        created_at: s.createdAt,
-        expires: s.expires,
-        expired: now > s.expires
+    if (this._allowed.has(entry.identity)) {
+      return this._confirm(request, entry, {
+        persist: false,
+        reason: 'allowlisted'
       })
     }
-    return result
-  }
 
-  getPending() {
-    return Array.from(this.pending.values()).map(p => ({
-      candidate_id: b4a.toString(p.req.id, 'hex'),
-      pubkey: b4a.toString(p.req.publicKey, 'hex'),
-      ticket: p.ticket
-    }))
-  }
-
-  cancelInvite(ticket) {
-    const session = this.sessions.get(ticket)
-    if (!session) return false
-    session.status = 'cancelled'
-    // Close this invite's swarm
-    const swarm = this._servers.get(ticket)
-    if (swarm) {
-      try { swarm.leave(swarm._topic); swarm.destroy() } catch {}
-      this._servers.delete(ticket)
+    if (this.allowAll) {
+      this._warnAllowAll()
+      return this._confirm(request, entry, {
+        persist: false,
+        reason: 'allow_all'
+      })
     }
-    return true
+
+    entry.decision = new Promise((resolve) => { entry.resolveDecision = resolve })
+    this._pending.set(entry.requestId, entry)
+    this.emit('pairing_request', publicRequest(entry))
+
+    await entry.decision
   }
 
-  cleanup() {
-    const now = Date.now()
-    for (const [ticket, session] of this.sessions) {
-      if (session.expires && now > session.expires) {
-        session.status = 'expired'
+  async _confirm (request, entry, opts) {
+    if (this.room === null || !this.room.writable) {
+      return this._rejectConfirmation(entry, request, 'not_writable')
+    }
+
+    try {
+      await this.room.addWriter({
+        writerKey: entry.writerKey,
+        identityKey: entry.identity,
+        displayName: entry.displayName
+      })
+    } catch (err) {
+      this.log(`could not add the candidate writer: ${err.message}`)
+      return this._rejectConfirmation(entry, request, 'add_writer_failed', err.message)
+    }
+
+    request.confirm({
+      key: this.room.key,
+      encryptionKey: this.room.encryptionKey
+    })
+
+    if (opts.persist) {
+      try {
+        saveAllowedIdentities([entry.identity], { aclFile: this.aclFile })
+        this._allowed.add(entry.identity)
+      } catch (err) {
+        this.log(`could not persist the accepted identity: ${err.message}`)
+      }
+    }
+
+    const record = {
+      request_id: entry.requestId,
+      requestId: entry.requestId,
+      invitation_id: entry.invitationId,
+      identity: entry.identity,
+      writer_key: entry.writerKey,
+      display_name: entry.displayName,
+      status: 'accepted',
+      reason: opts.reason,
+      persisted: opts.persist === true,
+      accepted_at: this.now()
+    }
+
+    this._recordHistory(record)
+    this.emit('pairing_confirmed', record)
+
+    return record
+  }
+
+  _rejectConfirmation (entry, request, reason, message) {
+    try {
+      request.deny({ status: 1 })
+    } catch {}
+
+    const record = {
+      request_id: entry.requestId,
+      requestId: entry.requestId,
+      invitation_id: entry.invitationId,
+      identity: entry.identity,
+      writer_key: entry.writerKey,
+      display_name: entry.displayName,
+      status: 'declined',
+      reason,
+      message,
+      resolved_at: this.now()
+    }
+
+    this._recordHistory(record)
+    this.emit('pairing_declined', record)
+
+    return record
+  }
+
+  _warnAllowAll () {
+    if (this._allowAllWarned) return
+    this._allowAllWarned = true
+    this.log(
+      'WARNING: KEET_ALLOW_ALL_USERS=true is active; any identity can pair and send messages. This development override is never persisted.'
+    )
+  }
+
+  _expirePending () {
+    if (this._pending.size === 0) return
+
+    const now = this.now()
+
+    for (const entry of [...this._pending.values()]) {
+      if (entry.expiresAt > now) continue
+      this._settleDenied(entry, 'expired', 3).catch((err) => {
+        this.log(`failed to expire a pairing request: ${err.message}`)
+      })
+    }
+  }
+
+  async joinInvite (url, opts = {}) {
+    if (this._closed) {
+      throw new PairingError('PAIRING_CLOSED', 'pairing has been closed')
+    }
+    if (this.identity === null) {
+      throw new PairingError('IDENTITY_REQUIRED', 'joining an invite requires an identity')
+    }
+    if (this._blind === null) {
+      await this.start()
+    }
+
+    const invite = decodeInviteUrl(url, {
+      now: this.now(),
+      roomKey: opts.expectedRoomKey
+    })
+    const writerKey = toKey(opts.writerKey, 'writerKey')
+    const timeoutMs = positiveInt(opts.timeoutMs, this.joinTimeoutMs)
+    const userData = encodeUserData({
+      identityKey: this.identity.publicKey,
+      writerKey,
+      displayName: opts.displayName
+    })
+
+    let candidate = null
+    let paired = false
+
+    try {
+      try {
+        candidate = this._blind.addCandidate({
+          invite: invite.standardInvite,
+          userData
+        })
+        await candidate.ready()
+      } catch (err) {
+        throw new PairingError('PAIRING_FAILED', `could not start candidate pairing: ${err.message}`)
+      }
+
+      const auth = await this._awaitCandidate(candidate, timeoutMs)
+
+      if (!auth || !auth.key) {
+        throw new PairingError('PAIRING_FAILED', 'candidate pairing returned no room key')
+      }
+      if (!b4a.equals(cryptoDiscoveryKey(auth.key), invite.discoveryKey)) {
+        throw new PairingError('DISCOVERY_KEY_MISMATCH', 'the paired room does not match the invite')
+      }
+      if (!auth.encryptionKey || auth.encryptionKey.byteLength !== KEY_BYTES) {
+        throw new PairingError('ENCRYPTION_KEY_MISSING', 'the paired room returned no encryption key')
+      }
+      if (
+        invite.encryptionKey !== null &&
+        !b4a.equals(invite.encryptionKey, auth.encryptionKey)
+      ) {
+        throw new PairingError(
+          'ENCRYPTION_KEY_MISMATCH',
+          'the paired room encryption key does not match the invite'
+        )
+      }
+
+      paired = true
+
+      return {
+        invitationId: invite.invitationId,
+        invitation_id: invite.invitationId,
+        discoveryKey: invite.discoveryKey,
+        discovery_key: invite.discoveryKeyHex,
+        roomKey: auth.key,
+        room_key: auth.key.toString('hex'),
+        encryptionKey: auth.encryptionKey,
+        encryption_key: auth.encryptionKey.toString('hex'),
+        data: auth.data,
+        writerKey,
+        writer_key: writerKey.toString('hex')
+      }
+    } finally {
+      if (candidate !== null && !paired) {
+        await this._closeCandidate(candidate)
       }
     }
   }
 
-  /**
-   * Close all pending servers and cleanup.
-   */
-  close() {
-    for (const [, swarm] of this._servers) {
-      try { swarm.destroy() } catch {}
+  async _closeCandidate (candidate) {
+    if (
+      candidate === null ||
+      typeof candidate !== 'object' ||
+      this._releasedCandidates.has(candidate)
+    ) {
+      return
     }
-    this._servers.clear()
-    this.sessions.clear()
-    this.pending.clear()
+
+    this._releasedCandidates.add(candidate)
+
+    try {
+      await candidate.close()
+    } catch (err) {
+      this.log(`failed to close a pairing candidate: ${err.message}`)
+    }
+  }
+
+  _awaitCandidate (candidate, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      let settled = false
+
+      const finish = (err, auth) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        candidate.request.removeListener('rejected', onRejected)
+
+        if (err) reject(err)
+        else resolve(auth)
+      }
+
+      const onRejected = (err) => {
+        finish(pairingErrorFor(err))
+      }
+
+      const timer = setTimeout(() => {
+        finish(new PairingError('PAIRING_TIMEOUT', 'candidate pairing timed out'))
+      }, timeoutMs)
+
+      if (typeof timer.unref === 'function') timer.unref()
+
+      candidate.request.once('rejected', onRejected)
+
+      candidate.pairing.then(
+        (auth) => finish(null, auth),
+        (err) => finish(pairingErrorFor(err))
+      )
+    })
+  }
+
+  async close () {
+    if (this._closed) return
+    this._closed = true
+
+    if (this._timer !== null) {
+      clearInterval(this._timer)
+      this._timer = null
+    }
+
+    for (const entry of [...this._pending.values()]) {
+      await this._settleDenied(entry, 'cancelled', 1)
+    }
+
+    for (const entry of [...this._invites.values()]) {
+      this._invites.delete(entry.invite.invitationId)
+      try {
+        await entry.member.close()
+      } catch (err) {
+        this.log(`failed to close an invite listener: ${err.message}`)
+      }
+    }
+
+    if (this._blind !== null) {
+      try {
+        await this._blind.close()
+      } catch (err) {
+        this.log(`failed to close blind pairing: ${err.message}`)
+      }
+      this._blind = null
+    }
   }
 }
 
-module.exports = PairingManager
+function delay (ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function positiveInt (value, fallback) {
+  const number = typeof value === 'string' ? Number(value) : value
+
+  if (!Number.isSafeInteger(number) || number <= 0) return fallback
+
+  return number
+}
+
+function cryptoDiscoveryKey (key) {
+  return crypto.discoveryKey(key)
+}
+
+function pairingErrorFor (err) {
+  const code = err && err.code
+
+  if (code === 'PAIRING_REJECTED' || code === 'INVITE_EXPIRED' || code === 'INVITE_USED') {
+    return new PairingError(code, err.message)
+  }
+
+  return new PairingError(
+    'PAIRING_FAILED',
+    err && err.message ? `candidate pairing failed: ${err.message}` : 'candidate pairing failed'
+  )
+}
+
+module.exports = {
+  PAIRING_VERSION,
+  USER_DATA_VERSION,
+  ALLOWLIST_VERSION,
+  MAX_USER_DATA_BYTES,
+  MAX_DISPLAY_NAME_BYTES,
+  DEFAULT_PENDING_TIMEOUT_MS,
+  DEFAULT_JOIN_TIMEOUT_MS,
+  PairingError,
+  Pairing,
+  encodeUserData,
+  decodeUserData,
+  parseAllowedUsers,
+  resolveAclFile,
+  loadAllowedIdentities,
+  saveAllowedIdentities
+}
