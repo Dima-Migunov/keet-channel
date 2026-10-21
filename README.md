@@ -1,3 +1,18 @@
+<h1 align="center">🚧&nbsp; WORK IN PROGRESS &nbsp;🚧</h1>
+
+<p align="center">
+  <img alt="status: alpha — not production ready" src="https://img.shields.io/badge/STATUS-ALPHA%20%C2%B7%20NOT%20PRODUCTION--READY-orange?style=for-the-badge">
+</p>
+
+> [!CAUTION]
+> **This project is under active development and is not ready for production use.**
+>
+> Interfaces, configuration, the wire protocol, and on-disk data formats may change
+> without notice and without migration paths. Use it for evaluation, experiments, and
+> development only — do not rely on it for real traffic or important data yet.
+
+---
+
 # Keet Channel for Hermes Agent
 
 A Hermes Agent platform plugin for the [Keet](https://keet.io) P2P messenger. The
