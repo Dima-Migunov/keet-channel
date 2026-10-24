@@ -2,10 +2,14 @@
 
 const { EventEmitter } = require('node:events')
 
-const PROTOCOL_VERSION = '1.0.0'
+const PROTOCOL_VERSION = '1.1.0'
 const DEFAULT_TIMEOUT_MS = 10_000
-const DEFAULT_MAX_LINE_BYTES = 1024 * 1024
+const DEFAULT_SEND_IMAGE_TIMEOUT_MS = 60_000
+const DEFAULT_MAX_LINE_BYTES = 21 * 1024 * 1024
+const MAX_REQUEST_ID_PREFIX_BYTES = 64 * 1024
 const DEFAULT_MAX_OUTBOUND_BYTES = 8 * 1024 * 1024
+
+const REQUEST_ID_PATTERN = /"request_id"\s*:\s*("(?:\\.|[^"\\])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/
 
 class RouterError extends Error {
   constructor (code, message) {
@@ -21,6 +25,11 @@ class RouterError extends Error {
  */
 const COMMANDS = new Map([
   ['send_message', { type: 'send_result', handle: (bridge, params) => bridge.sendMessage(params) }],
+  ['send_image', {
+    type: 'send_image_result',
+    timeoutMs: DEFAULT_SEND_IMAGE_TIMEOUT_MS,
+    handle: (bridge, params) => bridge.sendImage(params)
+  }],
   ['status', { type: 'status_result', handle: (bridge) => bridge.status() }],
   ['get_identity', { type: 'identity_result', handle: (bridge) => bridge.getIdentity() }],
   ['create_invite', { type: 'create_invite_result', handle: (bridge, params) => bridge.createInvite(params) }],
@@ -29,6 +38,9 @@ const COMMANDS = new Map([
   ['decline_pairing', { type: 'decline_pairing_result', handle: (bridge, params) => bridge.declinePairing(params) }],
   ['cancel_invite', { type: 'cancel_invite_result', handle: (bridge, params) => bridge.cancelInvite(params) }],
   ['pairing_list', { type: 'pairing_list_result', handle: (bridge, params) => bridge.pairingList(params) }],
+  ['acl_add', { type: 'acl_add_result', handle: (bridge, params) => bridge.aclAdd(params) }],
+  ['acl_remove', { type: 'acl_remove_result', handle: (bridge, params) => bridge.aclRemove(params) }],
+  ['acl_list', { type: 'acl_list_result', handle: (bridge, params) => bridge.aclList(params) }],
   ['join_room', { type: 'join_room_result', handle: (bridge, params) => bridge.joinRoom(params) }],
   ['connect_to_user', { type: 'connect_to_user_result', handle: (bridge, params) => bridge.connectToUser(params) }],
   ['send_welcome', { type: 'send_welcome_result', handle: (bridge, params) => bridge.sendWelcome(params) }],
@@ -36,16 +48,31 @@ const COMMANDS = new Map([
 ])
 
 const UNSUPPORTED_COMMANDS = new Set([
-  'send_image',
   'send_file',
   'send_attachment',
   'send_voice',
-  'send_video'
+  'send_video',
+  'send_animation'
 ])
 
 function isRequestId (value) {
   return (typeof value === 'string' && value.length > 0) ||
     (typeof value === 'number' && Number.isFinite(value))
+}
+
+function extractRequestId (buffer) {
+  const length = Math.min(buffer.length, MAX_REQUEST_ID_PREFIX_BYTES)
+  const text = buffer.toString('utf-8', 0, length)
+  const match = REQUEST_ID_PATTERN.exec(text)
+
+  if (!match) return null
+
+  try {
+    const value = JSON.parse(match[1])
+    return isRequestId(value) ? value : null
+  } catch {
+    return null
+  }
 }
 
 function serialize (value) {
@@ -74,6 +101,7 @@ class StdioRouter extends EventEmitter {
     this._pumping = false
     this._started = false
     this._stopped = false
+    this._discarding = false
     this._onData = (data) => this._receive(data)
     this._onEnd = () => {
       this.log('[stdio] stdin closed')
@@ -213,6 +241,14 @@ class StdioRouter extends EventEmitter {
     const chunk = Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'utf-8')
     if (chunk.length === 0) return
 
+    if (this._discarding) {
+      const newline = chunk.indexOf(0x0a)
+      if (newline === -1) return
+      this._discarding = false
+      this._receive(chunk.subarray(newline + 1))
+      return
+    }
+
     this._buffer = this._buffer.length === 0
       ? chunk
       : Buffer.concat([this._buffer, chunk], this._buffer.length + chunk.length)
@@ -221,9 +257,14 @@ class StdioRouter extends EventEmitter {
     let start = 0
     let index = this._buffer.indexOf(0x0a, start)
     while (index !== -1) {
-      const line = this._buffer.toString('utf-8', start, index)
+      const line = this._buffer.subarray(start, index)
       start = index + 1
-      if (line.trim()) this._ingest(line)
+      if (line.length > this.maxLineBytes) {
+        this._lineTooLarge(line)
+      } else if (line.length > 0) {
+        const text = line.toString('utf-8')
+        if (text.trim()) this._ingest(text)
+      }
       index = this._buffer.indexOf(0x0a, start)
     }
 
@@ -233,10 +274,20 @@ class StdioRouter extends EventEmitter {
     }
 
     if (this._bufferBytes > this.maxLineBytes) {
+      this._lineTooLarge(this._buffer)
       this._buffer = Buffer.alloc(0)
       this._bufferBytes = 0
-      this._sendError(null, 'line_too_large', `Request exceeds ${this.maxLineBytes} bytes`, null)
+      this._discarding = true
     }
+  }
+
+  _lineTooLarge (buffer) {
+    this._sendError(
+      extractRequestId(buffer),
+      'line_too_large',
+      `Request exceeds ${this.maxLineBytes} bytes`,
+      null
+    )
   }
 
   _ingest (line) {
@@ -287,7 +338,7 @@ class StdioRouter extends EventEmitter {
 
     let result
     try {
-      result = await this._runHandler(definition.handle, params, requestId, command)
+      result = await this._runHandler(definition, params, requestId, command)
     } catch (err) {
       if (err && err.code === 'timeout') {
         await this._sendError(requestId, 'timeout', err.message, command)
@@ -306,19 +357,22 @@ class StdioRouter extends EventEmitter {
     if (command === 'shutdown') this.emit('shutdown', response)
   }
 
-  _runHandler (handler, params, requestId, command) {
+  _runHandler (definition, params, requestId, command) {
     return new Promise((resolve, reject) => {
+      const timeoutMs = Number.isFinite(definition.timeoutMs)
+        ? definition.timeoutMs
+        : this.timeoutMs
       let settled = false
       const timer = setTimeout(() => {
         if (settled) return
         settled = true
-        reject(new RouterError('timeout', `Command timed out after ${this.timeoutMs}ms: ${command}`))
-      }, this.timeoutMs)
+        reject(new RouterError('timeout', `Command timed out after ${timeoutMs}ms: ${command}`))
+      }, timeoutMs)
       if (typeof timer.unref === 'function') timer.unref()
 
       let pending
       try {
-        pending = Promise.resolve(handler(this.bridge, params, { requestId, command, router: this }))
+        pending = Promise.resolve(definition.handle(this.bridge, params, { requestId, command, router: this }))
       } catch (err) {
         pending = Promise.reject(err)
       }
@@ -350,6 +404,7 @@ class StdioRouter extends EventEmitter {
   stop () {
     if (this._stopped) return
     this._stopped = true
+    this._discarding = false
     this._buffer = Buffer.alloc(0)
     this._bufferBytes = 0
     if (this.input && typeof this.input.removeListener === 'function') {
@@ -368,4 +423,6 @@ module.exports.COMMANDS = COMMANDS
 module.exports.UNSUPPORTED_COMMANDS = UNSUPPORTED_COMMANDS
 module.exports.PROTOCOL_VERSION = PROTOCOL_VERSION
 module.exports.DEFAULT_TIMEOUT_MS = DEFAULT_TIMEOUT_MS
+module.exports.DEFAULT_SEND_IMAGE_TIMEOUT_MS = DEFAULT_SEND_IMAGE_TIMEOUT_MS
+module.exports.DEFAULT_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
 module.exports.DEFAULT_MAX_OUTBOUND_BYTES = DEFAULT_MAX_OUTBOUND_BYTES

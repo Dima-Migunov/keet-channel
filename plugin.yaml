@@ -1,12 +1,14 @@
 name: keet-channel
 label: Keet
 kind: platform
-version: 0.4.0
+version: 1.0.0
 description: >
   Keet P2P messenger gateway adapter for Hermes Agent.
   Connects to a local Keet Bridge daemon via stdio JSON protocol.
-  Bridge runs as a plain Node.js subprocess — auto-detected,
-  auto-started, no manual config needed. Access is denied by default.
+  Supports text and images (PNG/JPEG/WebP/GIF, up to 10 MiB) over an
+  encrypted Autobase room. Bridge runs as a plain Node.js subprocess —
+  auto-detected, auto-started, no manual config needed. Access is denied
+  by default and can be managed at runtime.
 author: migunov
 optional_env:
   - name: KEET_ALLOWED_USERS

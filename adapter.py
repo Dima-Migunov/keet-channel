@@ -8,7 +8,10 @@ policy and request correlation.
 """
 
 import asyncio
+import base64
 import collections
+import hashlib
+import inspect
 import json
 import logging
 import os
@@ -17,6 +20,8 @@ import re
 import shutil
 import subprocess
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from typing import Optional
 
@@ -26,6 +31,7 @@ try:
     from gateway.platforms.base import (
         BasePlatformAdapter,
         MessageEvent,
+        MessageType,
         SendResult,
         cache_image_from_url,
     )
@@ -43,8 +49,11 @@ except ImportError:
                 setattr(self, key, value)
 
     class _SendResult:  # type: ignore[no-redef]
-        def __init__(self, ok=False, error=None, **fields):
-            self.ok = ok
+        def __init__(self, ok=False, error=None, success=None, **fields):
+            if success is None:
+                success = ok
+            self.success = bool(success)
+            self.ok = self.success
             self.error = error
             for key, value in fields.items():
                 setattr(self, key, value)
@@ -54,6 +63,11 @@ except ImportError:
     SendResult = _SendResult  # type: ignore[assignment]
     PlatformConfig = object  # type: ignore[assignment]
     Platform = None  # type: ignore[assignment]
+    cache_image_from_url = None  # type: ignore[assignment]
+
+    class MessageType:  # type: ignore[no-redef]
+        TEXT = "text"
+        PHOTO = "photo"
 
 
 PLATFORM = "keet"
@@ -85,15 +99,31 @@ STABLE_READY_SECONDS = 60.0
 # contact that returns after 4096 other identities.
 MAX_EVENT_QUEUE = 1024
 MAX_WELCOMED_CONTACTS = 4096
+MAX_PAIRING_REQUESTS = 128
+MAX_DELIVERY_STATUSES = 1024
 DEPENDENCY_SETUP_TIMEOUT = 300.0
 SETUP_SCRIPT_TIMEOUT = 300.0
 OVERFLOW_LOG_INTERVAL = 60.0
 
 _PROTOCOL_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 
-_UNSUPPORTED_IMAGE_ERROR = (
-    "Unsupported: image sending is not implemented by the Keet bridge"
+# The plugin's media limit for a single image. This is a product limit, not a
+# transport limit: the bridge's stdio line cap is larger to fit Base64 overhead.
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+_IMAGE_MIME_TYPES = (
+    ("image/png", lambda data: data.startswith(b"\x89PNG\r\n\x1a\n")),
+    ("image/jpeg", lambda data: data.startswith(b"\xff\xd8\xff")),
+    ("image/gif", lambda data: data.startswith((b"GIF87a", b"GIF89a"))),
+    (
+        "image/webp",
+        lambda data: len(data) >= 12
+        and data.startswith(b"RIFF")
+        and data[8:12] == b"WEBP",
+    ),
 )
+_IMAGE_FETCH_TIMEOUT = 30.0
+_IMAGE_READ_CHUNK = 64 * 1024
+SEND_IMAGE_TIMEOUT = 60.0
 
 
 def _now() -> float:
@@ -205,23 +235,195 @@ class KeetBridgeError(KeetError):
         self.operation = operation
 
 
+class KeetImageError(KeetError):
+    """An outbound image could not be resolved or validated."""
+
+    def __init__(self, code: str, message: str, operation: str = "send_image"):
+        super().__init__(message)
+        self.code = code
+        self.operation = operation
+
+
+def _result_ok(result) -> bool:
+    """Read success from either the current or legacy SendResult shape."""
+    if result is None:
+        return False
+    for attribute in ("success", "ok"):
+        value = getattr(result, attribute, None)
+        if value is not None:
+            return bool(value)
+    return False
+
+
 def _send_result(ok: bool, error: Optional[str] = None, **fields):
     """Build a SendResult while tolerating older gateway versions."""
-    try:
-        return SendResult(ok=ok, error=error, **fields)
-    except TypeError:
+    result = None
+    for factory in (
+        lambda: SendResult(success=ok, error=error),
+        lambda: SendResult(success=ok),
+        lambda: SendResult(ok=ok, error=error),
+        lambda: SendResult(ok=ok),
+        lambda: SendResult(),
+    ):
         try:
-            result = SendResult(ok=ok, error=error)
+            result = factory()
+            break
         except TypeError:
-            result = SendResult()
-            result.ok = ok
-            result.error = error
-        for key, value in fields.items():
+            continue
+
+    if result is None:
+        result = _SendResult(ok=ok, error=error)
+
+    for attribute, value in (("success", ok), ("ok", ok), ("error", error)):
+        try:
+            setattr(result, attribute, value)
+        except (AttributeError, TypeError):
+            pass
+    for key, value in fields.items():
+        try:
+            setattr(result, key, value)
+        except (AttributeError, TypeError):
+            pass
+    return result
+
+
+def _detect_image_mime(data: bytes) -> Optional[str]:
+    """Return the MIME type recognized from magic bytes, or None."""
+    for mime_type, matches in _IMAGE_MIME_TYPES:
+        if matches(data):
+            return mime_type
+    return None
+
+
+def _checked_image_size(size: int) -> None:
+    if size > MAX_IMAGE_BYTES:
+        raise KeetImageError(
+            "MEDIA_TOO_LARGE",
+            f"Image is larger than the {MAX_IMAGE_BYTES} byte limit",
+        )
+
+
+def _read_image_path(path) -> bytes:
+    """Read at most the image cap plus one byte from a local path."""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(MAX_IMAGE_BYTES + 1)
+    except (OSError, ValueError) as exc:
+        raise KeetImageError(
+            "IMAGE_UNREADABLE", f"Could not read image file: {exc}"
+        ) from exc
+    _checked_image_size(len(data))
+    return data
+
+
+def _fetch_image_url(url: str) -> bytes:
+    """Bounded standard-library HTTP(S) fallback when Hermes caching is absent."""
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "keet-channel/1.0",
+            "Accept": "image/*,*/*;q=0.8",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_IMAGE_FETCH_TIMEOUT) as response:
+            declared = response.headers.get("Content-Length")
+            if declared is not None:
+                try:
+                    _checked_image_size(int(declared))
+                except ValueError:
+                    pass
+            chunks = []
+            total = 0
+            while True:
+                chunk = response.read(
+                    min(_IMAGE_READ_CHUNK, MAX_IMAGE_BYTES - total + 1)
+                )
+                if not chunk:
+                    break
+                total += len(chunk)
+                _checked_image_size(total)
+                chunks.append(chunk)
+            return b"".join(chunks)
+    except KeetImageError:
+        raise
+    except Exception as exc:
+        raise KeetImageError(
+            "IMAGE_UNREADABLE", f"Could not fetch image URL: {exc}"
+        ) from exc
+
+
+def _cached_image_bytes(cached) -> bytes:
+    """Normalize a cache helper result to bytes and enforce the image cap."""
+    if isinstance(cached, (bytes, bytearray, memoryview)):
+        data = bytes(cached)
+        _checked_image_size(len(data))
+        return data
+    if isinstance(cached, (str, os.PathLike)):
+        return _read_image_path(cached)
+    raise KeetImageError(
+        "IMAGE_UNREADABLE", "Image cache helper returned an unsupported value"
+    )
+
+
+async def _resolve_image(source) -> tuple[bytes, str]:
+    """Resolve a URL, ``file://`` URL, or local path to checked image bytes.
+
+    HTTP(S) uses Hermes's ``cache_image_from_url`` when present and falls back
+    to a bounded standard-library fetch otherwise. The returned MIME type is
+    always derived from magic bytes, never from a file extension or header.
+    """
+    if isinstance(source, (str, os.PathLike)):
+        try:
+            raw = os.fspath(source)
+        except TypeError as exc:
+            raise KeetImageError(
+                "INVALID_IMAGE_SOURCE", "Image source must be a URL or path"
+            ) from exc
+        text = os.fsdecode(raw)
+    else:
+        raise KeetImageError(
+            "INVALID_IMAGE_SOURCE", "Image source must be a URL or path"
+        )
+
+    if not text:
+        raise KeetImageError("INVALID_IMAGE_SOURCE", "Image source is empty")
+
+    lowered = text.lower()
+    if lowered.startswith(("http://", "https://")):
+        if cache_image_from_url is not None:
             try:
-                setattr(result, key, value)
-            except AttributeError:
-                pass
-        return result
+                cached = cache_image_from_url(text)
+                if inspect.isawaitable(cached):
+                    cached = await cached
+                data = _cached_image_bytes(cached)
+            except KeetImageError:
+                raise
+            except Exception as exc:
+                raise KeetImageError(
+                    "IMAGE_UNREADABLE", f"Could not fetch image URL: {exc}"
+                ) from exc
+        else:
+            data = await asyncio.to_thread(_fetch_image_url, text)
+    elif lowered.startswith("file:"):
+        parts = urllib.parse.urlsplit(text)
+        if parts.netloc and parts.netloc.lower() not in ("", "localhost"):
+            raise KeetImageError(
+                "INVALID_IMAGE_SOURCE", "file:// URLs must refer to the local host"
+            )
+        path = urllib.parse.unquote(parts.path)
+        if not path:
+            raise KeetImageError("INVALID_IMAGE_SOURCE", "file:// URL has no path")
+        data = await asyncio.to_thread(_read_image_path, path)
+    else:
+        data = await asyncio.to_thread(_read_image_path, text)
+
+    mime_type = _detect_image_mime(data)
+    if mime_type is None:
+        raise KeetImageError(
+            "INVALID_IMAGE", "Image data is not PNG, JPEG, WebP, or GIF"
+        )
+    return data, mime_type
 
 
 class KeetAdapter(BasePlatformAdapter):
@@ -231,7 +433,8 @@ class KeetAdapter(BasePlatformAdapter):
 
     READY_TIMEOUT = 45.0
     REQUEST_TIMEOUT = 30.0
-    SHUTDOWN_TIMEOUT = 15.0
+    SHUTDOWN_TIMEOUT = 5.0
+    TERMINATE_TIMEOUT = 2.0
     STDERR_BUFFER_LINES = 200
 
     def __init__(self, config: Optional["PlatformConfig"] = None, **kwargs):
@@ -291,9 +494,16 @@ class KeetAdapter(BasePlatformAdapter):
         self._allowed_users = allowed
         self._invalid_allowed = invalid
         self._dynamic_allowed: set[str] = set()
+        self._revoked_allowed: set[str] = set()
         self._load_persisted_acl()
 
         self._welcomed_contacts: collections.OrderedDict[str, None] = (
+            collections.OrderedDict()
+        )
+        self._pairing_requests: collections.OrderedDict[str, dict] = (
+            collections.OrderedDict()
+        )
+        self._delivery_status: collections.OrderedDict[str, dict] = (
             collections.OrderedDict()
         )
         self._stderr: collections.deque[str] = collections.deque(
@@ -326,6 +536,129 @@ class KeetAdapter(BasePlatformAdapter):
             self._welcomed_contacts.popitem(last=False)
         return True
 
+    # ── pairing request queue ─────────────────────────────────────────────
+
+    def get_pairing_requests(self) -> list[dict]:
+        """Return a copy of the bounded pending pairing-request queue."""
+        return [dict(record) for record in self._pairing_requests.values()]
+
+    def clear_pairing_requests(self) -> list[dict]:
+        """Clear and return the queued pairing requests."""
+        cleared = self.get_pairing_requests()
+        self._pairing_requests.clear()
+        return cleared
+
+    def _queue_pairing_request(self, event: dict) -> Optional[dict]:
+        request_id = event.get("request_id") or event.get("requestId")
+        if not isinstance(request_id, str) or not request_id:
+            logger.warning("[Keet] Ignoring pairing request without a request id")
+            return None
+
+        identity = _normalize_identity(event.get("identity"))
+        if not identity:
+            logger.warning(
+                "[Keet] Ignoring pairing request %s with an invalid identity", request_id
+            )
+            return None
+
+        record = {
+            "request_id": request_id,
+            "identity": identity,
+            "invitation_id": event.get("invitation_id") or event.get("invitationId"),
+            "writer_key": event.get("writer_key") or event.get("writerKey"),
+            "display_name": event.get("display_name") or event.get("displayName") or "",
+            "created_at": event.get("created_at") or event.get("createdAt"),
+            "expires_at": event.get("expires_at") or event.get("expiresAt"),
+            "status": event.get("status") or "pending",
+            "received_at": int(time.time() * 1000),
+        }
+
+        if request_id in self._pairing_requests:
+            del self._pairing_requests[request_id]
+        self._pairing_requests[request_id] = record
+
+        while len(self._pairing_requests) > MAX_PAIRING_REQUESTS:
+            dropped_id, _ = self._pairing_requests.popitem(last=False)
+            logger.warning(
+                "[Keet] Pairing request queue is full (%d); dropped oldest request %s",
+                MAX_PAIRING_REQUESTS,
+                dropped_id,
+            )
+
+        logger.info(
+            "keet_pairing_request %s",
+            json.dumps(record, sort_keys=True, separators=(",", ":")),
+        )
+        return record
+
+    async def _notify_pairing_request(self, record: dict) -> None:
+        callback = getattr(self, "on_pairing_request", None)
+        if not callable(callback):
+            return
+        try:
+            result = callback(dict(record))
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.warning("[Keet] Pairing request callback failed: %s", exc)
+
+    # ── delivery observations ─────────────────────────────────────────────
+
+    def get_delivery_status(self, message_id: str) -> Optional[dict]:
+        """Return the latest replication observation for a message, if any.
+
+        A ``replicated`` record means the bridge observed a peer after the
+        append; it is not a read receipt and does not mean the recipient
+        displayed the message.
+        """
+        if not isinstance(message_id, str) or not message_id:
+            return None
+        record = self._delivery_status.get(message_id)
+        return dict(record) if record is not None else None
+
+    def _record_delivery_update(self, event: dict) -> Optional[dict]:
+        message_id = event.get("message_id") or event.get("messageId")
+        if not isinstance(message_id, str) or not message_id:
+            logger.warning("[Keet] Ignoring delivery update without a message id")
+            return None
+
+        status = event.get("status")
+        if status not in ("replicated", "expired"):
+            logger.warning(
+                "[Keet] Ignoring delivery update for %s with invalid status %r",
+                message_id[:16],
+                status,
+            )
+            return None
+
+        peer_count = event.get("peer_count", event.get("peerCount", 0))
+        if isinstance(peer_count, bool) or not isinstance(peer_count, int) or peer_count < 0:
+            peer_count = 0
+
+        timestamp = event.get("timestamp")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+            timestamp = int(time.time() * 1000)
+
+        room_key = event.get("room_key") or event.get("roomKey") or ""
+        record = {
+            "message_id": message_id,
+            "room_key": room_key,
+            "status": status,
+            "peer_count": peer_count,
+            "timestamp": timestamp,
+        }
+
+        self._delivery_status.pop(message_id, None)
+        self._delivery_status[message_id] = record
+        while len(self._delivery_status) > MAX_DELIVERY_STATUSES:
+            self._delivery_status.popitem(last=False)
+
+        logger.info(
+            "keet_delivery_update %s",
+            json.dumps(record, sort_keys=True, separators=(",", ":")),
+        )
+        return record
+
 
     # ── configuration helpers ─────────────────────────────────────────────
 
@@ -346,7 +679,9 @@ class KeetAdapter(BasePlatformAdapter):
         return os.path.join(self._data_dir, "allowed.json")
 
     def _load_persisted_acl(self) -> set[str]:
-        """Load identities written by an accepted bridge pairing."""
+        """Load the bridge's persisted ACL, including runtime revocations."""
+        self._dynamic_allowed.clear()
+        self._revoked_allowed.clear()
         path = self._acl_path()
         try:
             with open(path, "r", encoding="utf-8") as handle:
@@ -368,7 +703,76 @@ class KeetAdapter(BasePlatformAdapter):
                 self._dynamic_allowed.add(identity)
             else:
                 logger.warning("[Keet] Ignoring invalid allowlist entry: %r", record)
+
+        revoked = payload.get("revoked") if isinstance(payload, dict) else None
+        if revoked is not None and not isinstance(revoked, list):
+            logger.warning("[Keet] Ignoring allowlist %s: revoked must be a list", path)
+        elif isinstance(revoked, list):
+            for record in revoked:
+                identity = _normalize_identity(record)
+                if identity:
+                    self._revoked_allowed.add(identity)
+                else:
+                    logger.warning(
+                        "[Keet] Ignoring invalid revoked allowlist entry: %r", record
+                    )
+
         return set(self._dynamic_allowed)
+
+    def _apply_acl_snapshot(self, result: dict) -> None:
+        """Mirror an `acl_list` result into the adapter's local cache."""
+        if not isinstance(result, dict):
+            raise ValueError("acl_list did not return an object")
+
+        identities = result.get("identities")
+        revoked = result.get("revoked")
+        entries = result.get("entries")
+
+        if not isinstance(identities, list):
+            identities = []
+            if isinstance(entries, list):
+                identities = [
+                    entry.get("identity")
+                    for entry in entries
+                    if isinstance(entry, dict) and entry.get("authorized", True)
+                ]
+
+        effective = set()
+        for record in identities:
+            identity = _normalize_identity(record)
+            if identity:
+                effective.add(identity)
+
+        denied = set()
+        if isinstance(revoked, list):
+            for record in revoked:
+                identity = _normalize_identity(record)
+                if identity:
+                    denied.add(identity)
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get("revoked") is not True:
+                    continue
+                identity = _normalize_identity(entry.get("identity"))
+                if identity:
+                    denied.add(identity)
+
+        self._dynamic_allowed = effective - self._allowed_users
+        self._revoked_allowed = denied
+
+    async def _sync_acl(self) -> bool:
+        """Refresh the local ACL cache from the bridge after readiness."""
+        try:
+            result = await self._request("acl_list", {})
+        except Exception as exc:
+            logger.warning("[Keet] Could not sync the bridge ACL: %s", exc)
+            return False
+        try:
+            self._apply_acl_snapshot(result)
+        except Exception as exc:
+            logger.warning("[Keet] Invalid acl_list response: %s", exc)
+            return False
+        return True
 
     def _log_access_policy(self) -> None:
         """Explain the access policy at startup; default is deny."""
@@ -401,6 +805,8 @@ class KeetAdapter(BasePlatformAdapter):
     def _is_allowed(self, identity: str) -> bool:
         normalized = _normalize_identity(identity)
         if not normalized:
+            return False
+        if normalized in self._revoked_allowed:
             return False
         if self._allow_all():
             return True
@@ -510,6 +916,7 @@ class KeetAdapter(BasePlatformAdapter):
         self._readiness_ok = False
         self._readiness_error = None
         self._home_mismatch = False
+        self._delivery_status.clear()
 
     async def connect(self) -> bool:
         """Start the bridge and wait for its readiness event.
@@ -642,6 +1049,7 @@ class KeetAdapter(BasePlatformAdapter):
 
         self._connected = True
         self._restart_attempt = 0
+        self._track(asyncio.create_task(self._sync_acl()))
         self._ensure_supervisor(proc)
         self._schedule_stable_reset()
         logger.info("[Keet] Adapter connected")
@@ -853,15 +1261,20 @@ class KeetAdapter(BasePlatformAdapter):
         if self._process is proc:
             self._process = None
 
-    async def _terminate_process(self, proc: asyncio.subprocess.Process) -> None:
+    async def _terminate_process(
+        self,
+        proc: asyncio.subprocess.Process,
+        timeout: Optional[float] = None,
+    ) -> None:
         if proc.returncode is not None:
             return
         try:
             proc.terminate()
         except ProcessLookupError:
             return
+        grace = self.TERMINATE_TIMEOUT if timeout is None else timeout
         try:
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
+            await asyncio.wait_for(proc.wait(), timeout=grace)
         except asyncio.TimeoutError:
             try:
                 proc.kill()
@@ -1098,6 +1511,10 @@ class KeetAdapter(BasePlatformAdapter):
             await self._on_message(event)
             return
 
+        if event_type == "delivery_update":
+            self._record_delivery_update(event)
+            return
+
         if event_type == "invite_created":
             url = event.get("invite_url") or event.get("url")
             if url:
@@ -1114,17 +1531,19 @@ class KeetAdapter(BasePlatformAdapter):
             return
 
         if event_type == "pairing_request":
-            logger.info(
-                "[Keet] Pairing request from %s (request %s)",
-                str(event.get("identity", "?"))[:16],
-                event.get("request_id", "?"),
-            )
+            record = self._queue_pairing_request(event)
+            if record is not None:
+                await self._notify_pairing_request(record)
             return
 
         if event_type == "pairing_confirmed":
+            request_id = event.get("request_id") or event.get("requestId")
+            if isinstance(request_id, str):
+                self._pairing_requests.pop(request_id, None)
             identity = _normalize_identity(event.get("identity"))
             if identity and event.get("status") == "accepted":
                 self._dynamic_allowed.add(identity)
+                self._revoked_allowed.discard(identity)
             logger.info(
                 "[Keet] Pairing confirmed for %s (%s)",
                 str(event.get("identity", "?"))[:16],
@@ -1133,6 +1552,9 @@ class KeetAdapter(BasePlatformAdapter):
             return
 
         if event_type in ("pairing_declined", "pairing_expired"):
+            request_id = event.get("request_id") or event.get("requestId")
+            if isinstance(request_id, str):
+                self._pairing_requests.pop(request_id, None)
             logger.info(
                 "[Keet] Pairing %s for %s (%s)",
                 "expired" if event_type == "pairing_expired" else "declined",
@@ -1175,6 +1597,115 @@ class KeetAdapter(BasePlatformAdapter):
 
         logger.debug("[Keet] Ignoring unknown bridge event: %s", event_type)
 
+    # ── inbound media ─────────────────────────────────────────────────────
+
+    def _media_inbox_dir(self) -> str:
+        return os.path.realpath(os.path.join(self._data_dir, "media", "inbox"))
+
+    def _resolve_inbox_file(self, path) -> Optional[str]:
+        """Resolve a path and return it only when it is inside the media inbox."""
+        if not isinstance(path, str) or not path or "\x00" in path:
+            return None
+        try:
+            resolved = os.path.realpath(path)
+        except (OSError, ValueError):
+            return None
+        root = self._media_inbox_dir()
+        try:
+            if os.path.commonpath([root, resolved]) != root or resolved == root:
+                return None
+        except ValueError:
+            return None
+        return resolved
+
+    def _verify_inbound_media(self, media) -> tuple[str, str]:
+        """Validate a bridge media descriptor against the local inbox file."""
+        if not isinstance(media, dict):
+            raise KeetImageError("INVALID_MEDIA", "Media metadata is not an object")
+
+        resolved = self._resolve_inbox_file(media.get("path"))
+        if resolved is None:
+            raise KeetImageError(
+                "OUTSIDE_INBOX", "Media path is not inside the Keet media inbox"
+            )
+
+        try:
+            info = os.stat(resolved)
+        except OSError as exc:
+            raise KeetImageError("MEDIA_NOT_FOUND", f"Media file is unavailable: {exc}") from exc
+        if not pathlib.Path(resolved).is_file():
+            raise KeetImageError("NOT_A_FILE", "Media path is not a regular file")
+
+        declared_size = media.get("size")
+        if (
+            not isinstance(declared_size, int)
+            or isinstance(declared_size, bool)
+            or declared_size < 0
+        ):
+            raise KeetImageError("INVALID_MEDIA_SIZE", "Media size is invalid")
+        if declared_size > MAX_IMAGE_BYTES:
+            raise KeetImageError(
+                "MEDIA_TOO_LARGE",
+                f"Image is larger than the {MAX_IMAGE_BYTES} byte limit",
+            )
+        if info.st_size != declared_size:
+            raise KeetImageError(
+                "MEDIA_SIZE_MISMATCH", "Media file size does not match its metadata"
+            )
+
+        try:
+            with open(resolved, "rb") as handle:
+                data = handle.read(MAX_IMAGE_BYTES + 1)
+        except OSError as exc:
+            raise KeetImageError("MEDIA_NOT_FOUND", f"Media file is unavailable: {exc}") from exc
+        if len(data) != declared_size:
+            raise KeetImageError(
+                "MEDIA_SIZE_MISMATCH", "Media file size does not match its metadata"
+            )
+
+        declared_mime = media.get("mime_type") or media.get("mimeType")
+        if not isinstance(declared_mime, str):
+            raise KeetImageError("INVALID_MIME_TYPE", "Media MIME type is invalid")
+        declared_mime = declared_mime.strip().lower()
+        detected_mime = _detect_image_mime(data)
+        if detected_mime is None:
+            raise KeetImageError(
+                "INVALID_IMAGE", "Image data is not PNG, JPEG, WebP, or GIF"
+            )
+        if declared_mime != detected_mime:
+            raise KeetImageError(
+                "MIME_MISMATCH", "Media MIME type does not match the image bytes"
+            )
+
+        declared_digest = media.get("sha256")
+        if not isinstance(declared_digest, str) or not _IDENTITY_RE.match(
+            declared_digest.strip().lower()
+        ):
+            raise KeetImageError("INVALID_MEDIA_DIGEST", "Media digest is invalid")
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != declared_digest.strip().lower():
+            raise KeetImageError(
+                "MEDIA_DIGEST_MISMATCH", "Media digest does not match the image bytes"
+            )
+
+        return resolved, declared_mime
+
+    def _remove_inbox_media(self, media) -> bool:
+        """Remove a denied sender's file only when it resolves inside the inbox."""
+        if not isinstance(media, dict):
+            return False
+        resolved = self._resolve_inbox_file(media.get("path"))
+        if resolved is None:
+            return False
+        try:
+            os.unlink(resolved)
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            logger.debug("[Keet] Could not remove denied media file: %s", exc)
+            return False
+
     async def _on_message(self, event: dict) -> None:
         """Handle an incoming message from Keet."""
         sender = _normalize_identity(event.get("sender") or event.get("from"))
@@ -1182,9 +1713,12 @@ class KeetAdapter(BasePlatformAdapter):
         text = event.get("text", "")
         timestamp = event.get("timestamp", event.get("ts", 0)) or 0
         message_id = event.get("message_id") or str(timestamp)
+        media = event.get("media")
 
         if not sender:
             self._log_denial("")
+            if media is not None:
+                await asyncio.to_thread(self._remove_inbox_media, media)
             return
 
         if self._identity and sender == self._identity:
@@ -1193,12 +1727,30 @@ class KeetAdapter(BasePlatformAdapter):
 
         if not self._is_allowed(sender):
             self._log_denial(sender)
+            if media is not None:
+                await asyncio.to_thread(self._remove_inbox_media, media)
             return
+
+        media_path = None
+        media_mime = None
+        if media is not None:
+            try:
+                media_path, media_mime = await asyncio.to_thread(
+                    self._verify_inbound_media, media
+                )
+            except KeetImageError as exc:
+                logger.warning(
+                    "[Keet] Dropping message with invalid media from %s: %s (%s)",
+                    sender[:16],
+                    exc.code,
+                    exc,
+                )
+                return
 
         if self._remember_welcome(sender):
             logger.info("[Keet] First contact from %s — sending welcome", sender[:16])
             result = await self.send(chat_id, WELCOME_MESSAGE)
-            if not getattr(result, "ok", False):
+            if not _result_ok(result):
                 logger.warning(
                     "[Keet] Welcome to %s failed: %s",
                     sender[:16],
@@ -1211,14 +1763,26 @@ class KeetAdapter(BasePlatformAdapter):
             user_id=sender,
             thread_id=chat_id,
         )
-        message = MessageEvent(
-            platform=PLATFORM,
-            source=source,
-            text=text,
-            message_id=str(message_id),
-            timestamp=timestamp,
-        )
-        await self.on_message(message)
+        fields = {
+            "platform": PLATFORM,
+            "source": source,
+            "text": text if isinstance(text, str) else "",
+            "message_id": str(message_id),
+            "timestamp": timestamp,
+        }
+        if media_path is not None:
+            fields.update(
+                message_type=MessageType.PHOTO,
+                media_urls=[media_path],
+                media_types=[media_mime],
+            )
+        message = MessageEvent(**fields)
+
+        handler = getattr(self, "handle_message", None)
+        if callable(handler):
+            await handler(message)
+        else:
+            await self.on_message(message)
 
     # ── sending ───────────────────────────────────────────────────────────
 
@@ -1276,16 +1840,105 @@ class KeetAdapter(BasePlatformAdapter):
     async def send_image(
         self,
         chat_id: str,
-        url: str,
+        url,
         caption: Optional[str] = None,
         **kwargs,
     ):
-        """Image sending is not implemented by the bridge."""
+        """Resolve and send one PNG, JPEG, WebP, or GIF image.
+
+        The adapter resolves the source and enforces the 10 MiB limit before it
+        calls the bridge, so oversized or unreadable inputs never reach the
+        room. The bridge receives the canonical Base64 payload and returns the
+        durable message id, digest, and replication status.
+        """
+        if not self._connected or self._process is None:
+            return _send_result(
+                False,
+                "Not connected",
+                code="not_connected",
+                operation="send_image",
+            )
+
+        try:
+            data, mime_type = await _resolve_image(url)
+        except KeetImageError as exc:
+            return _send_result(
+                False,
+                str(exc),
+                code=exc.code,
+                operation=exc.operation,
+            )
+        except Exception as exc:
+            return _send_result(
+                False,
+                f"Could not resolve image: {exc}",
+                code="IMAGE_UNREADABLE",
+                operation="send_image",
+            )
+
+        payload = {
+            "mime_type": mime_type,
+            "base64_data": base64.b64encode(data).decode("ascii"),
+            "caption": "" if caption is None else caption,
+        }
+        try:
+            result = await self._request(
+                "send_image",
+                {"room_key": chat_id, "payload": payload},
+                timeout=SEND_IMAGE_TIMEOUT,
+            )
+        except KeetTimeout as exc:
+            return _send_result(
+                False,
+                str(exc),
+                code="timeout",
+                operation="send_image",
+            )
+        except KeetBridgeError as exc:
+            return _send_result(
+                False,
+                f"{exc.code}: {exc}",
+                code=exc.code,
+                operation=exc.operation or "send_image",
+            )
+        except KeetNotConnected as exc:
+            return _send_result(
+                False,
+                f"Bridge disconnected: {exc}",
+                code="not_connected",
+                operation="send_image",
+            )
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            return _send_result(
+                False,
+                f"Bridge disconnected: {exc}",
+                code="bridge_disconnected",
+                operation="send_image",
+            )
+
         return _send_result(
-            False,
-            _UNSUPPORTED_IMAGE_ERROR,
-            code="unsupported_command",
-            operation="send_image",
+            True,
+            message_id=result.get("message_id"),
+            room_key=result.get("room_key") or chat_id,
+            chat_id=result.get("chat_id") or chat_id,
+            mime_type=result.get("mime_type") or mime_type,
+            size=result.get("size", len(data)),
+            sha256=result.get("sha256") or hashlib.sha256(data).hexdigest(),
+            replicated_peers=result.get("replicated_peers", 0),
+            queued=result.get("queued", True),
+            timestamp=result.get("timestamp"),
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        file_path,
+        caption: Optional[str] = None,
+        **kwargs,
+    ):
+        """Send a local image file through the same resolved-image path."""
+        return await self.send_image(
+            chat_id, file_path, caption=caption, **kwargs
         )
 
     # ── public API ────────────────────────────────────────────────────────
@@ -1308,26 +1961,49 @@ class KeetAdapter(BasePlatformAdapter):
     def get_invite(self) -> Optional[str]:
         return self._invite_url
 
-    def add_allowed_user(self, identity: str) -> bool:
-        """Authorize a stable identity for this process.
+    async def add_allowed_user(self, identity: str) -> bool:
+        """Authorize a stable identity through the bridge's persistent ACL.
 
         Only a 64-hex identity public key is accepted; connection ids and
-        display names can never grant access. Persistence is handled by the
-        bridge when a pairing request is accepted.
+        display names can never grant access. The bridge writes the change
+        atomically before returning success.
         """
         normalized = _normalize_identity(identity)
         if not normalized:
             logger.warning("[Keet] Refusing to authorize invalid identity: %r", identity)
             return False
-        if normalized in self._dynamic_allowed or normalized in self._allowed_users:
+        try:
+            await self._request("acl_add", {"identity": normalized})
+        except Exception as exc:
+            logger.warning("[Keet] Could not add allowed identity %s: %s", normalized[:16], exc)
             return False
         self._dynamic_allowed.add(normalized)
+        self._revoked_allowed.discard(normalized)
         logger.info("[Keet] Added allowed identity: %s", normalized[:16])
         return True
 
-    def get_allowed_users(self) -> list[str]:
-        """Return configured and pairing-granted identities."""
-        return sorted(self._allowed_users | self._dynamic_allowed)
+    async def remove_allowed_user(self, identity: str) -> bool:
+        """Revoke an identity through the bridge, even if it is configured."""
+        normalized = _normalize_identity(identity)
+        if not normalized:
+            logger.warning("[Keet] Refusing to revoke invalid identity: %r", identity)
+            return False
+        try:
+            await self._request("acl_remove", {"identity": normalized})
+        except Exception as exc:
+            logger.warning("[Keet] Could not remove allowed identity %s: %s", normalized[:16], exc)
+            return False
+        self._dynamic_allowed.discard(normalized)
+        self._revoked_allowed.add(normalized)
+        logger.info("[Keet] Removed allowed identity: %s", normalized[:16])
+        return True
+
+    async def get_allowed_users(self) -> list[str]:
+        """Return the effective ACL reported by the bridge."""
+        await self._sync_acl()
+        return sorted(
+            (self._allowed_users | self._dynamic_allowed) - self._revoked_allowed
+        )
 
     async def create_invite(self, room_key: Optional[str] = None) -> dict:
         """Create an invite and store the returned URL."""
@@ -1343,16 +2019,20 @@ class KeetAdapter(BasePlatformAdapter):
         result = await self._request(
             "accept_pairing", {"pairing_request_id": request_id}
         )
+        self._pairing_requests.pop(request_id, None)
         identity = _normalize_identity(result.get("identity"))
         if identity:
             self._dynamic_allowed.add(identity)
+            self._revoked_allowed.discard(identity)
         return result
 
     async def decline_pairing(self, request_id: str) -> dict:
         """Decline a pending pairing request."""
-        return await self._request(
+        result = await self._request(
             "decline_pairing", {"pairing_request_id": request_id}
         )
+        self._pairing_requests.pop(request_id, None)
+        return result
 
     async def cancel_invite(self, invitation_id: Optional[str] = None) -> dict:
         """Cancel one invite, or the active invite when no id is given."""
@@ -1440,29 +2120,31 @@ class KeetAdapter(BasePlatformAdapter):
 
         proc = self._process
         if proc is not None:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self.SHUTDOWN_TIMEOUT
             if proc.returncode is None and proc.stdin is not None:
                 try:
-                    await self._request(
-                        "shutdown", timeout=min(5.0, self.SHUTDOWN_TIMEOUT)
-                    )
+                    await self._request("shutdown", timeout=self.SHUTDOWN_TIMEOUT)
                 except (KeetError, OSError):
                     pass
             if proc.returncode is None:
+                remaining = max(0.0, deadline - loop.time())
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=self.SHUTDOWN_TIMEOUT)
+                    await asyncio.wait_for(proc.wait(), timeout=remaining)
                 except asyncio.TimeoutError:
-                    logger.warning("[Keet] Bridge did not stop in time; killing it")
-                    try:
-                        proc.kill()
-                    except ProcessLookupError:
-                        pass
-                    await proc.wait()
+                    logger.warning(
+                        "[Keet] Bridge did not exit within %.1fs; terminating it",
+                        self.SHUTDOWN_TIMEOUT,
+                    )
+                    await self._terminate_process(proc)
             self._process = None
 
         self._fail_pending(KeetNotConnected("Keet bridge disconnected"))
         await self._cancel_owned_tasks()
         self._event_queue.clear()
         self._event_available.clear()
+        self._pairing_requests.clear()
+        self._delivery_status.clear()
 
         logger.info("[Keet] Disconnected")
 
@@ -1611,7 +2293,7 @@ def _standalone_send(chat_id: str, text: str, **kwargs) -> dict:
 
             result = await adapter.send(target, text, **kwargs)
             payload = {
-                "ok": bool(getattr(result, "ok", False)),
+                "ok": _result_ok(result),
                 "error": getattr(result, "error", None),
             }
             for field in (
@@ -1730,6 +2412,8 @@ def register(ctx) -> None:
         platform_hint=(
             "You are communicating via Keet, a P2P encrypted messenger. "
             "Messages are end-to-end encrypted and sent directly peer-to-peer. "
-            "Plain text only — markdown is not rendered."
+            "Markdown is not rendered. You can send and receive PNG, JPEG, WebP, "
+            "and GIF images up to 10 MiB. Files, voice, video, and animations "
+            "are not supported."
         ),
     )

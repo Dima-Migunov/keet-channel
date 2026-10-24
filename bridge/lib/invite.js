@@ -5,6 +5,7 @@ const c = require('compact-encoding')
 const crypto = require('hypercore-crypto')
 const z32 = require('z32')
 const blindPairing = require('blind-pairing-core')
+const keetInvitation = require('./keet-invitation')
 
 const { createErrorClass } = require('./errors')
 const { KEY_BYTES, normalizeKey: normalizeProtocolKey } = require('./keys')

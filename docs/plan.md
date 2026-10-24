@@ -49,13 +49,15 @@ It communicates with the adapter exclusively over stdin/stdout.
 
 | Module | Responsibility |
 | --- | --- |
-| `bridge/index.js` | Lifecycle: identity → Corestore → room → pairing → swarm → readiness |
+| `bridge/index.js` | Lifecycle: identity → media store → Corestore → room → pairing → swarm → readiness; shutdown deadline |
 | `bridge/lib/identity.js` | `keet-identity-key` mnemonic load/generate, atomic writes, permissions |
 | `bridge/lib/room.js` | Encrypted Autobase, `messages`/`members` views, append, replication |
-| `bridge/lib/pairing.js` | `BlindPairing` member/candidate, pending requests, allowlist |
-| `bridge/lib/messages.js` | `compact-encoding` codecs, canonical Ed25519 signing, dedupe |
+| `bridge/lib/pairing.js` | `BlindPairing` member/candidate, pending requests, v2 allowlist/revocations |
+| `bridge/lib/messages.js` | `compact-encoding` codecs (text v1, image v2), canonical Ed25519 signing, dedupe |
+| `bridge/lib/media.js` | MIME/magic-byte validation, strict Base64, SHA-256, atomic inbox, retention |
+| `bridge/lib/delivery.js` | Bounded `delivery_update` tracker with TTL and timer cleanup |
 | `bridge/lib/invite.js` | Keet invite envelope encode/decode, `keet://chat/<z32>` |
-| `bridge/lib/stdio.js` | Command router, `request_id` correlation, typed errors |
+| `bridge/lib/stdio.js` | Command router, `request_id` correlation, typed errors, bounded writer |
 
 ### Responsibilities
 
@@ -67,7 +69,12 @@ It communicates with the adapter exclusively over stdin/stdout.
   confirm or deny.
 - Replicate the room over Hyperswarm and report peer counts truthfully.
 - Keep stdout protocol-only; send all diagnostics to stderr.
-- Shut down cleanly on `shutdown`, `SIGINT`, and `SIGTERM`.
+- Validate and persist inbound images atomically in `media/inbox/`, enforce the
+  10 MiB decoded limit, and prune the inbox to 512 files / 7 days.
+- Track `queued: true` sends in a bounded delivery tracker until one terminal
+  `replicated` or `expired` update is emitted.
+- Shut down cleanly and idempotently on `shutdown`, `SIGINT`, and `SIGTERM`,
+  flushing the terminal response and exiting within 5 seconds.
 
 ### Invite format
 
@@ -79,20 +86,26 @@ one invite is active at a time; creating a new one replaces it.
 
 ### Room and messages
 
-Autobase nodes are `register`, `add-writer`, and `message`. A message carries a
-version, room key, random `messageId`, sender identity, millisecond timestamp,
-UTF-8 text up to 4096 bytes, and a detached Ed25519 signature over the canonical
-fields. The apply function accepts a message only when the writer is mapped to
-the same identity in `members`; malformed entries are logged and skipped.
+Autobase nodes are `register`, `add-writer`, and `message`. A version-1 message
+carries a version, room key, random `messageId`, sender identity, millisecond
+timestamp, UTF-8 text up to 4096 bytes, and a detached Ed25519 signature over the
+canonical fields. Version 2 appends a signed media descriptor: an allowlisted
+image MIME type, decoded size, SHA-256, and at most 10 MiB of image bytes. Decode
+rejects unknown versions before interpreting later fields, checks MIME and magic
+bytes, size, and digest, then verifies the signature. The apply function accepts a
+message only when the writer is mapped to the same identity in `members`;
+malformed entries are logged and skipped.
 
 Sends are acknowledged after the durable local append. Zero connected peers
 yields `queued: true` with `replicated_peers: 0`; the entry replicates later.
-There is no retry queue.
+There is no retry queue. Each `queued: true` send creates one delivery record:
+`replicated` when a room peer is observed before the TTL (default 60 seconds) or
+`expired` otherwise. This is replication opportunity, never a read receipt.
 
 ## Hermes Plugin
 
 ```text
-plugin.yaml       # name: keet-channel, version 0.4.0
+plugin.yaml       # name: keet-channel, version 1.0.0, protocol 1.1.0
 __init__.py       # register(ctx)
 adapter.py        # KeetAdapter(BasePlatformAdapter)
 ```
@@ -102,14 +115,20 @@ Adapter responsibilities:
 - Locate and spawn the bridge, installing missing npm dependencies.
 - Wait for `welcome_room_ready`; never report connected before it.
 - Correlate requests by `request_id` with a pending-future map and timeout.
-- Dispatch messages, pairing events, invite events, and member events.
+- Dispatch messages, media, pairing events, invite events, member events, and
+  `delivery_update`.
 - Supervise the process: fail pending requests on exit and restart with
   backoff `1, 2, 4, 8, 16, 30` seconds, reset after 60 seconds stable.
-- Apply default-deny access policy from `KEET_ALLOWED_USERS` and
-  `allowed.json`; filter self-messages by the readiness identity.
-- Return `unsupported_command` for `send_image` and other attachments without
-  calling the bridge.
-- Provide standalone/cron delivery through the same durable send path.
+- Apply default-deny access policy from `KEET_ALLOWED_USERS`, `allowed.json` v2,
+  and runtime `acl_add`/`acl_remove`/`acl_list`; revocation wins over
+  configuration. Filter self-messages by the readiness identity.
+- Resolve image URLs and local paths, enforce the 10 MiB cap, and call
+  `send_image`; file, voice, video, animation, and generic attachments are
+  rejected as `unsupported_command`.
+- Queue inbound pairing requests (128 entries), log `keet_pairing_request`, and
+  require explicit `accept_pairing`/`decline_pairing`.
+- Provide standalone/cron delivery through the same durable send path; stop the
+  bridge within a 5-second deadline and escalate to terminate/kill if needed.
 
 ## Data Directory
 
@@ -117,13 +136,14 @@ Adapter responsibilities:
 <KEET_DATA_DIR or ~/.keet-channel>/
   identity.json   # mnemonic/seed, never logged (0600)
   room.json       # room key, encryption key, writer key (0600)
-  allowed.json    # accepted identities
+  allowed.json    # ACL v2: persisted identities and revocations (0600)
   corestore/      # Hypercore/Autobase storage
+  media/inbox/    # received images, <messageId>.<ext> (0700, files 0600)
 ```
 
 The directory is `0700`; writes are atomic. The same directory restores
-identity, room key, invite, allowlist, and history after restart. Only one
-bridge may open it at a time.
+identity, room key, invite, ACL, media inbox, and history after restart. Only
+one bridge may open it at a time.
 
 ## Phases
 
@@ -145,20 +165,30 @@ bridge may open it at a time.
 - Blind-pairing member/candidate flows, pending requests, allowlist
   auto-confirm.
 - Hyperswarm replication on the room discovery key.
-- Correlated stdio router, truthful status, single readiness event, shutdown.
-- `node:test` suites for identity, invite, messages, room, pairing, stdio, and
-  the spawned bridge.
+- Correlated stdio router, truthful status, single readiness event, bounded
+  shutdown within 5 seconds.
+- Image message v2 codec, media store with atomic inbox writes and retention,
+  and `send_image` with bounded concurrency.
+- Bounded delivery tracker for `queued: true` sends.
+- `node:test` suites for identity, invite, messages, media, delivery, room,
+  pairing, stdio, lifecycle, and the spawned bridge.
 
 ### Phase 3: Hermes plugin — complete
 
 - `plugin.yaml`, `__init__.py`, `adapter.py`.
 - Readiness handshake, correlated requests, event dispatch.
-- Send path with durable/queued results; attachments rejected as unsupported.
-- Supervision, bounded restart, idempotent disconnect.
+- Send path with durable/queued results; images via `send_image`; file, voice,
+  video, animation, and generic attachments rejected as unsupported.
+- Supervision, bounded restart, idempotent 5-second disconnect with
+  terminate/kill escalation.
 - Default-deny ACL, allowlist persistence, self-message filtering.
+- Runtime ACL v2 with persisted revocations, atomic writes, and serialized
+  mutations.
+- Bounded pairing-request queue, explicit approval, and `keet_pairing_request`
+  logging.
 - Standalone/cron send with a stable room-key home channel.
-- Python contract tests covering protocol, readiness, supervision, ACL, and
-  standalone delivery.
+- Python contract tests covering protocol, readiness, supervision, ACL,
+  pairing, media, delivery, and standalone delivery.
 
 ### Phase 4: Live integration — pending
 
@@ -176,7 +206,19 @@ bridge may open it at a time.
 - `scripts/setup.sh` requires Node >= 24, installs dependencies, and has no
   Pear prompt.
 - CI installs root and bridge dependencies and runs both test suites.
-- OpenSpec change `make-keet-channel-interoperable` validates strictly.
+- OpenSpec change `production-ready-v1` validates strictly.
+
+### Phase 6: Production hardening — complete except the 48-hour soak
+
+- Protocol `1.1.0`: `send_image`, `acl_add`, `acl_remove`, `acl_list`, 21 MiB
+  stdio line limit, 60-second image timeout.
+- 10 MiB image validation and atomic inbox retention.
+- Dynamic ACL v2 with revocation precedence.
+- Delivery tracking with one terminal update per queued send.
+- Idempotent 5-second shutdown on `shutdown`, `SIGINT`, and `SIGTERM`.
+- 50-message inbound isolation test and 50-command concurrency test.
+- `scripts/soak.js` runner and `docs/soak-test.md` checklist; the 48-hour run
+  remains **pending** until executed against a long-running gateway.
 
 ## Breaking Changes from 0.1
 
@@ -187,8 +229,8 @@ bridge may open it at a time.
 - `KEET_INVITE_URL` and stderr scraping are removed.
 - Access is denied by default; unset `KEET_ALLOWED_USERS` no longer means
   allow-all.
-- Images and attachments return `unsupported_command` instead of appearing to
-  succeed.
+- Images are supported from 1.0.0; files, voice, video, animation, and generic
+  attachments still return `unsupported_command`.
 
 ## Risks
 
@@ -200,7 +242,7 @@ bridge may open it at a time.
 | Mnemonic at rest is sensitive | `0700`/`0600`, atomic writes, never log the mnemonic |
 | Autobase writer/indexer bugs | Add writer before confirmation, validate `base.writable`, explicit `not_writable` error |
 | No live client in CI | Loopback tests as CI gate; live checklist as release gate |
-| Breaking change for existing users | Ship adapter and bridge together at 0.4.0; document new invite and home channel |
+| Breaking change for existing users | Ship adapter and bridge together at 1.0.0; document new invite, home channel, and image support |
 
 ## Verification
 
@@ -210,7 +252,10 @@ cd bridge && npm ci && npm test
 cd ..
 python -m pip install -r requirements-dev.txt
 python -m pytest tests/ -q
-openspec validate make-keet-channel-interoperable --strict
+openspec validate production-ready-v1 --strict
+
+# Resource smoke; the 48-hour run is documented in docs/soak-test.md
+node scripts/soak.js --duration 10 --interval 1 --cleanup-data
 ```
 
 The bridge suite uses a loopback DHT and never contacts a public network or a

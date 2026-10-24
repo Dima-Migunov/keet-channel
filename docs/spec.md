@@ -1,6 +1,6 @@
 # Technical Specification: Keet Channel Plugin for Hermes Agent
 
-Version 0.4.0 | Protocol version 1.0.0 | Author: migunov
+Version 1.0.0 | Protocol version 1.1.0 | Author: migunov
 
 ## 1. Overview
 
@@ -26,22 +26,25 @@ adapter.py  ── stdin/stdout JSON lines ──▶  bridge/index.js
                                               ├── lib/room.js      Autobase + Corestore
                                               ├── lib/pairing.js   blind-pairing
                                               ├── lib/messages.js  compact-encoding + Ed25519
+                                              ├── lib/media.js     10 MiB images + inbox
+                                              ├── lib/delivery.js  bounded delivery updates
                                               ├── lib/invite.js    keet://chat/<z32>
                                               └── lib/stdio.js     command router
 ```
 
 | Component | Path | Description |
 | --- | --- | --- |
-| Plugin manifest | `plugin.yaml` | Hermes metadata, version 0.4.0 |
+| Plugin manifest | `plugin.yaml` | Hermes metadata, version 1.0.0 |
 | Python adapter | `adapter.py` | Process lifecycle, protocol, ACL, cron |
-| Bridge entrypoint | `bridge/index.js` | Startup ordering and orchestration |
-| Bridge modules | `bridge/lib/*.js` | Identity, room, pairing, messages, invite, stdio |
+| Bridge entrypoint | `bridge/index.js` | Startup ordering, media ownership, shutdown |
+| Bridge modules | `bridge/lib/*.js` | Identity, room, pairing, messages, media, delivery, invite, stdio |
+| Soak runner | `scripts/soak.js` | 48-hour RSS, fd, queue, media, inbox sampling |
 | Bridge tests | `bridge/test/*.test.js` | `node:test` suites, loopback DHT only |
 | Adapter tests | `tests/test_adapter.py` | `pytest` + `pytest-asyncio` |
 | Protocol | `docs/protocol.md` | Exact command/response/event schemas |
 
-Startup order in the bridge is: identity → Corestore → room → swarm → pairing
-listener → first invite → exactly one `welcome_room_ready` event. No protocol
+Startup order in the bridge is: identity → media store → Corestore → room → swarm →
+pairing listener → first invite → exactly one `welcome_room_ready` event. No protocol
 output is emitted before readiness, and all diagnostics go to stderr. The
 adapter validates the readiness identity, room key, protocol version, and home
 channel before it reports the connection as ready.
@@ -66,8 +69,11 @@ channel before it reports the connection as ready.
 - On first start, `keet-identity-key` generates a BIP-39 mnemonic and derives
   the identity; later starts load the same identity.
 - `room.json` persists the room key, encryption key, and local writer key.
-- `allowed.json` persists accepted pairing identities and is overridable with
-  `KEET_ACL_FILE`.
+- `allowed.json` v2 (`{version, identities, revoked}`) persists accepted and
+  revoked identities and is overridable with `KEET_ACL_FILE`.
+- Inbound images live in `media/inbox/` (`0700`, files `0600`); writes use a
+  `.tmp-*` file, `fsync`, and `rename`, and temp files are removed at startup
+  and shutdown.
 - Directory mode is `0700`; secret files are `0600`; writes are atomic.
 - A restart with the same data directory restores identity, room key, invite,
   allowlist, and message history. Only one bridge may open a directory at a
@@ -79,13 +85,20 @@ channel before it reports the connection as ready.
   `messageId`, and delivered to the adapter as `message` events.
 - The adapter emits a Hermes `MessageEvent` only for identities allowed by its
   policy.
-- `send_message` appends a signed entry to the local Autobase and
-  acknowledges only after the durable append.
+- `send_message`, `send_welcome`, and `send_image` append a signed entry to the
+  local Autobase and acknowledge only after the durable append.
 - With no connected peer, the result is a successful queued send:
   `queued: true`, `replicated_peers: 0`. The entry replicates when a peer
-  connects; there is no separate retry queue.
+  connects; there is no separate retry queue. Each queued send emits exactly one
+  terminal `delivery_update` (`replicated` or `expired`).
 - Maximum text length is **4096 UTF-8 bytes**.
-- Message format is plain text; no markdown rendering or attachments.
+- Images: PNG, JPEG, WebP, or GIF, at most **10 MiB** decoded. MIME is detected
+  from magic bytes, Base64 must be canonical, and size/SHA-256 are verified.
+  Inbound files are persisted atomically before the message enters the view.
+  One stdio line is capped at **21 MiB** and at most two media transfers run at
+  once.
+- Message format is plain text plus an optional single image; markdown is not
+  rendered and other attachments are unsupported.
 
 ### 3.4 Invitations and pairing
 
@@ -100,7 +113,9 @@ channel before it reports the connection as ready.
   and confirms with the room and encryption keys.
 - Unknown candidates stay pending until `accept_pairing` or `decline_pairing`.
   Pending requests expire after `KEET_PAIRING_TIMEOUT_MS` (default 5 minutes) or
-  with the invite, and are not durable across restarts.
+  with the invite, and are not durable across restarts. The incoming request
+  queue is bounded at 128 entries; the oldest is evicted and the event is logged
+  with the `keet_pairing_request` tag.
 - Allowlisted identities and `KEET_ALLOW_ALL_USERS=true` are confirmed
   automatically; allow-all logs a warning and is never persisted.
 - Creating a new invite replaces the previous active invite.
@@ -113,6 +128,10 @@ channel before it reports the connection as ready.
   Entries are trimmed and lowercased; invalid entries are logged and skipped.
 - Accepted pairing identities are persisted to `allowed.json` and enforced by
   both the bridge and adapter after restart.
+- `acl_add`, `acl_remove`, and `acl_list` manage the ACL at runtime. Mutations
+  are serialized, persisted atomically before memory changes, and reported back
+  to the adapter. Revocation overrides `KEET_ALLOWED_USERS`; re-adding an
+  identity clears its revocation.
 - `KEET_ALLOW_ALL_USERS` is true only for the literal `true`; it is a
   development-only override with no persistence.
 - Room membership and `member_joined` events never authorize an identity.
@@ -136,11 +155,14 @@ channel before it reports the connection as ready.
 - On unexpected exit, pending requests fail with a disconnect error and the
   adapter restarts the bridge with delays `1, 2, 4, 8, 16, 30` seconds (capped
   at 30, reset after 60 seconds of stable readiness).
-- `disconnect()` sends `shutdown`, waits up to 15 seconds, force-kills if
-  necessary, is idempotent, and suppresses restart.
-- The bridge `shutdown` handler flushes storage, closes pairing, room, swarm,
-  and Corestore, writes its result, and exits 0. `SIGINT` and `SIGTERM` take
-  the same path.
+- `disconnect()` sends `shutdown`, waits up to 5 seconds for process exit, then
+  escalates to `terminate` and `kill`, is idempotent, and suppresses restart.
+  Pending requests are failed and futures cleared.
+- The bridge `shutdown` handler is idempotent: it flushes room storage, clears
+  delivery timers, removes media temp files, closes media, pairing, room,
+  swarm/DHT, and Corestore, flushes the terminal response, and exits 0 within
+  5 seconds. `SIGINT` and `SIGTERM` take the same path; a second signal during
+  shutdown is a no-op, and a hung close still exits via the deadline.
 
 ## 4. Protocol Summary
 
@@ -151,15 +173,17 @@ request carries a `request_id`, echoed on its terminal response.
 Supported commands:
 
 ```text
-send_message   send_welcome    status          get_identity
-create_invite  join_invite     accept_pairing  decline_pairing
-cancel_invite  pairing_list    join_room       connect_to_user
+send_message   send_image      send_welcome    status
+get_identity   create_invite   join_invite     accept_pairing
+decline_pairing cancel_invite   pairing_list    acl_add
+acl_remove     acl_list        join_room       connect_to_user
 shutdown
 ```
 
-`send_image`, `send_file`, `send_attachment`, `send_voice`, and `send_video`
-return a typed `unsupported_command` error without touching the room. Any other
-unknown command uses the same code. Readiness is a single
+`send_image` accepts `{mime_type, base64_data, caption?}`. `send_file`,
+`send_attachment`, `send_voice`, `send_video`, and `send_animation` return a
+typed `unsupported_command` error without touching the room. Any other unknown
+command uses the same code. Readiness is a single
 `welcome_room_ready` event containing `protocol_version`, `identity`,
 `room_key`, `invite_url`, `started_at`, and `started_at_ms`.
 
@@ -175,9 +199,14 @@ Full field-level schemas, error codes, and event definitions are in
 | Python | >= 3.9 |
 | Linux dependency | `libatomic1` may be needed by `sodium-native` |
 | Transport | stdio, newline-delimited JSON |
-| Protocol version | 1.0.0 |
+| Protocol version | 1.1.0 |
 | Max message length | 4096 UTF-8 bytes |
-| Message format | Plain text |
+| Message format | Plain text, optional single PNG/JPEG/WebP/GIF image |
+| Max decoded image | 10 MiB |
+| Max stdio line | 21 MiB |
+| Media concurrency | 2 |
+| Inbox retention | 512 files / 7 days |
+| Shutdown deadline | 5 seconds, exit 0 |
 | Bridge tests | `cd bridge && npm test` |
 | Adapter tests | `python -m pytest tests/ -q` |
 | PII safety | Identity keys are public; mnemonic never logged |
@@ -202,6 +231,10 @@ default until an allowlist is set or a pairing request is accepted.
 | `KEET_DHT_BOOTSTRAP` | Comma-separated `host:port` DHT nodes | public DHT |
 | `KEET_INVITE_FORMAT` | `keet` or `standard` | `keet` |
 | `KEET_PAIRING_TIMEOUT_MS` | Pending pairing lifetime | 5 minutes |
+| `KEET_MEDIA_MAX_FILES` | Inbox file-count retention | `512` |
+| `KEET_MEDIA_MAX_AGE_MS` | Inbox age retention | 7 days |
+| `KEET_DELIVERY_TTL_MS` | Queued-delivery update TTL | `60000` |
+| `KEET_DELIVERY_MAX_PENDING` | Tracked queued sends | `1024` |
 | `KEET_NODE_PATH` | Explicit Node.js binary | `node` from `PATH` |
 
 ## 7. Installation
@@ -224,7 +257,7 @@ pairing request. See [README.md](../README.md),
 ## 8. Unsupported Surface
 
 - App-level wire compatibility with the closed Keet chat schema.
-- Images, files, attachments, voice, and video.
+- Files, attachments, voice, video, and animations (images are supported).
 - Multi-device identity attestation, key rotation, and account recovery.
 - Group administration, moderation, and a pairing UI.
 - WebSocket transport, port 5335, and the Pear/Bare runtime.
@@ -239,18 +272,20 @@ The compatibility boundary and its verification status are recorded in
 cd bridge && npm test
 python -m pip install -r requirements-dev.txt
 python -m pytest tests/ -q
-openspec validate make-keet-channel-interoperable --strict
+openspec validate production-ready-v1 --strict
+node scripts/soak.js --duration 10 --interval 1 --cleanup-data
 ```
 
 Bridge tests use a loopback DHT; neither suite requires a public network or a
 live Keet client. The manual two-host Keet 4.24.0 checklist is tracked as task
-12.5 and marked pending until executed.
+12.5 and marked pending until executed. The 48-hour resource soak and its
+thresholds are documented in [docs/soak-test.md](soak-test.md).
 
 ## 10. Roadmap
 
 | Phase | Status | Description |
 | --- | --- | --- |
 | Phase 1 | ✅ | Research: Keet, Hypercore/Hyperswarm, blind-pairing |
-| Phase 2 | ✅ | Bridge and adapter at 0.4.0, protocol 1.0.0 |
+| Phase 2 | ✅ | Bridge and adapter at 1.0.0, protocol 1.1.0 |
 | Phase 3 | ⬜ | Manual integration test with live Keet 4.24.0 |
 | Phase 4 | ✅ | Documentation, CI, and OpenSpec change |

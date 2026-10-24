@@ -9,10 +9,13 @@ const Hyperswarm = require('hyperswarm')
 const { Identity, resolveDataDir } = require('./lib/identity')
 const { Room } = require('./lib/room')
 const { Pairing } = require('./lib/pairing')
+const { MediaStore, validateMedia } = require('./lib/media')
+const { DeliveryTracker } = require('./lib/delivery')
 const StdioRouter = require('./lib/stdio')
 const { PROTOCOL_VERSION } = require('./lib/stdio')
 
-const DEFAULT_SHUTDOWN_TIMEOUT_MS = 15_000
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5_000
+const MAX_MEDIA_CONCURRENCY = 2
 
 class BridgeError extends Error {
   constructor (code, message) {
@@ -70,6 +73,7 @@ class KeetBridge extends EventEmitter {
     this.room = null
     this.pairing = null
     this.swarm = null
+    this.mediaStore = null
     this.router = null
     this.startedAt = null
     this._welcomed = false
@@ -78,11 +82,18 @@ class KeetBridge extends EventEmitter {
     this._shutdownPromise = null
     this._closed = false
     this._roomMessageHandler = (message) => this._forwardMessage(message)
+    this._roomPeerHandler = (event) => this._observeRoomPeer(event)
     this._pairingHandlers = new Map()
     this._homeChannel = typeof this.env.KEET_HOME_CHANNEL === 'string' && this.env.KEET_HOME_CHANNEL.trim() !== ''
       ? this.env.KEET_HOME_CHANNEL.trim().toLowerCase()
       : null
     this._bootstrap = opts.bootstrap || parseBootstrap(this.env.KEET_DHT_BOOTSTRAP)
+    this._mediaActive = 0
+    this.delivery = new DeliveryTracker({
+      env: this.env,
+      log: (message) => this.log(message)
+    })
+    this.delivery.on('update', (update) => this._forward(update))
   }
 
   get roomKey () {
@@ -122,7 +133,15 @@ class KeetBridge extends EventEmitter {
       this.log(`[bridge] identity ${this.identity.publicKeyHex}`)
 
       // 2. Room storage (Autobase + Corestore), re-opening persisted history.
-      this.room = await Room.open({ dataDir: this.dataDir, identity: this.identity, env: this.env })
+      //    One media store is shared by inbound room ingestion and outbound
+      //    commands, and is owned by the bridge so shutdown can clean it up.
+      this.mediaStore = new MediaStore({ dataDir: this.dataDir, env: this.env })
+      this.room = await Room.open({
+        dataDir: this.dataDir,
+        identity: this.identity,
+        env: this.env,
+        mediaStore: this.mediaStore
+      })
       this.log(`[bridge] room ${this.room.keyHex} (writer ${this.room.writerKeyHex})`)
 
       // 3. DHT transport.
@@ -203,6 +222,15 @@ class KeetBridge extends EventEmitter {
       this.swarm = null
     }
 
+    if (this.mediaStore) {
+      try {
+        await this.mediaStore.close()
+      } catch (err) {
+        this.log(`[bridge] media cleanup failed: ${err.message}`)
+      }
+      this.mediaStore = null
+    }
+
     if (this.identity && typeof this.identity.clear === 'function') {
       try {
         this.identity.clear()
@@ -241,7 +269,10 @@ class KeetBridge extends EventEmitter {
   }
 
   _attachEvents () {
-    if (this.room) this.room.on('message', this._roomMessageHandler)
+    if (this.room) {
+      this.room.on('message', this._roomMessageHandler)
+      this.room.on('peer', this._roomPeerHandler)
+    }
 
     if (!this.pairing) return
 
@@ -278,15 +309,41 @@ class KeetBridge extends EventEmitter {
   }
 
   _detachEvents () {
-    if (this.room) this.room.off('message', this._roomMessageHandler)
+    if (this.room) {
+      this.room.off('message', this._roomMessageHandler)
+      this.room.off('peer', this._roomPeerHandler)
+    }
     if (this.pairing) {
       for (const [event, handler] of this._pairingHandlers) this.pairing.off(event, handler)
     }
     this._pairingHandlers.clear()
   }
 
+  _observeRoomPeer (event) {
+    const observed = event && Number.isFinite(event.peerCount)
+      ? event.peerCount
+      : (this.room ? this.room.peerCount : 0)
+    if (observed < 1) return
+
+    try {
+      this.delivery.observePeer(observed)
+    } catch (err) {
+      this.log(`[bridge] failed to record peer delivery: ${err.message}`)
+    }
+  }
+
+  _trackDelivery (ack) {
+    if (!ack || ack.queued !== true) return
+
+    try {
+      this.delivery.track({ messageId: ack.messageId, roomKey: ack.roomKey })
+    } catch (err) {
+      this.log(`[bridge] failed to track queued delivery: ${err.message}`)
+    }
+  }
+
   _forwardMessage (message) {
-    this._forward({
+    const event = {
       type: 'message',
       chat_id: message.roomKey,
       room_key: message.roomKey,
@@ -296,7 +353,18 @@ class KeetBridge extends EventEmitter {
       text: message.text,
       timestamp: message.timestamp,
       ts: message.timestamp
-    })
+    }
+
+    if (message.media) {
+      event.media = {
+        path: message.media.path,
+        mime_type: message.media.mime_type,
+        size: message.media.size,
+        sha256: message.media.sha256
+      }
+    }
+
+    this._forward(event)
   }
 
   // --- command handlers -------------------------------------------------
@@ -310,6 +378,7 @@ class KeetBridge extends EventEmitter {
     this._assertRoom(params.room_key || params.chat_id)
 
     const ack = await this.room.send(text)
+    this._trackDelivery(ack)
     return {
       message_id: ack.messageId,
       room_key: ack.roomKey,
@@ -317,6 +386,58 @@ class KeetBridge extends EventEmitter {
       replicated_peers: ack.replicatedPeers,
       queued: ack.queued,
       timestamp: ack.timestamp
+    }
+  }
+
+  async sendImage (params = {}) {
+    this._assertRoom(params.room_key || params.chat_id)
+
+    if (!this.room) {
+      throw new BridgeError('NOT_READY', 'the bridge is not ready')
+    }
+
+    this._acquireMediaSlot()
+
+    try {
+      const payload = params.payload && typeof params.payload === 'object' && !Array.isArray(params.payload)
+        ? params.payload
+        : params
+
+      const media = validateMedia({
+        mimeType: payload.mime_type ?? payload.mimeType,
+        base64_data: payload.base64_data ?? payload.base64Data,
+        size: payload.size,
+        sha256: payload.sha256
+      })
+
+      const caption = payload.caption === undefined ? '' : payload.caption
+      if (typeof caption !== 'string') {
+        throw new BridgeError('INVALID_TEXT', 'send_image caption must be a string')
+      }
+
+      const ack = await this.room.send(caption, {
+        media: {
+          mimeType: media.mimeType,
+          size: media.size,
+          sha256: media.sha256,
+          bytes: media.bytes
+        }
+      })
+      this._trackDelivery(ack)
+
+      return {
+        message_id: ack.messageId,
+        room_key: ack.roomKey,
+        chat_id: ack.roomKey,
+        mime_type: media.mimeType,
+        size: media.size,
+        sha256: media.sha256,
+        replicated_peers: ack.replicatedPeers,
+        queued: ack.queued,
+        timestamp: ack.timestamp
+      }
+    } finally {
+      this._releaseMediaSlot()
     }
   }
 
@@ -341,6 +462,9 @@ class KeetBridge extends EventEmitter {
       invite_url: this.inviteUrl,
       peer_count: this.room ? this.room.peerCount : 0,
       queued_messages: this.room ? this.room.queuedMessages : 0,
+      media_active: this._mediaActive,
+      media_limit: MAX_MEDIA_CONCURRENCY,
+      delivery_pending: this.delivery ? this.delivery.size : 0,
       message_count: roomStatus ? roomStatus.messageCount : 0,
       member_count: roomStatus ? roomStatus.memberCount : 0,
       writable: this.room ? this.room.writable : false,
@@ -436,6 +560,29 @@ class KeetBridge extends EventEmitter {
     }
   }
 
+  _aclIdentity (params = {}) {
+    const identity = params.identity || params.identity_key || params.identityKey
+    if (typeof identity !== 'string' || identity.length === 0) {
+      throw new BridgeError('INVALID_IDENTITY', 'an identity is required')
+    }
+    return identity
+  }
+
+  async aclAdd (params = {}) {
+    if (!this.pairing) throw new BridgeError('NOT_READY', 'the bridge is not ready')
+    return this.pairing.aclAdd(this._aclIdentity(params))
+  }
+
+  async aclRemove (params = {}) {
+    if (!this.pairing) throw new BridgeError('NOT_READY', 'the bridge is not ready')
+    return this.pairing.aclRemove(this._aclIdentity(params))
+  }
+
+  async aclList () {
+    if (!this.pairing) throw new BridgeError('NOT_READY', 'the bridge is not ready')
+    return this.pairing.aclList()
+  }
+
   async joinRoom (params = {}) {
     const requested = params.room_key || params.chat_id
     if (requested === undefined || requested === null || requested === '') {
@@ -486,6 +633,20 @@ class KeetBridge extends EventEmitter {
     }
   }
 
+  _acquireMediaSlot () {
+    if (this._mediaActive >= MAX_MEDIA_CONCURRENCY) {
+      throw new BridgeError(
+        'MEDIA_BUSY',
+        `Too many concurrent media transfers (limit ${MAX_MEDIA_CONCURRENCY})`
+      )
+    }
+    this._mediaActive += 1
+  }
+
+  _releaseMediaSlot () {
+    if (this._mediaActive > 0) this._mediaActive -= 1
+  }
+
   shutdown () {
     if (this._shutdownPromise !== null) return this._shutdownPromise
 
@@ -506,6 +667,8 @@ class KeetBridge extends EventEmitter {
       // Stop accepting commands but leave queued output in place; the protocol
       // writer is flushed by the caller before the process exits.
       if (this.router) this.router.stop()
+
+      this.delivery.close()
 
       if (this.pairing) {
         try {
@@ -537,6 +700,15 @@ class KeetBridge extends EventEmitter {
           this.log(`[bridge] swarm destroy failed: ${err.message}`)
         }
         this.swarm = null
+      }
+
+      if (this.mediaStore) {
+        try {
+          await this.mediaStore.close()
+        } catch (err) {
+          this.log(`[bridge] media close failed: ${err.message}`)
+        }
+        this.mediaStore = null
       }
 
       if (this.identity && typeof this.identity.clear === 'function') {
@@ -578,22 +750,29 @@ async function main () {
   const shutdown = async (code) => {
     if (shuttingDown) return
     shuttingDown = true
-    const force = setTimeout(() => process.exit(1), DEFAULT_SHUTDOWN_TIMEOUT_MS)
-    if (typeof force.unref === 'function') force.unref()
+
+    // The deadline timer is deliberately not unref'd: even a hung close must
+    // terminate the process with the negotiated exit code.
+    const deadline = setTimeout(() => {
+      console.error(`[bridge] shutdown deadline of ${DEFAULT_SHUTDOWN_TIMEOUT_MS}ms exceeded; exiting ${code}`)
+      process.exit(code)
+    }, DEFAULT_SHUTDOWN_TIMEOUT_MS)
+
     try {
       await bridge.shutdown()
       if (bridge.router) bridge.router.stop()
       await flushAndExit(bridge.router, code)
-      clearTimeout(force)
     } catch (err) {
-      clearTimeout(force)
+      clearTimeout(deadline)
       console.error(`[bridge] shutdown failed: ${err.message}`)
       process.exit(1)
     }
   }
 
-  process.once('SIGINT', () => { shutdown(0) })
-  process.once('SIGTERM', () => { shutdown(0) })
+  // Keep the handlers installed so a signal that arrives during shutdown is a
+  // no-op instead of the default terminate action.
+  process.on('SIGINT', () => { shutdown(0) })
+  process.on('SIGTERM', () => { shutdown(0) })
 
   try {
     await bridge.start()

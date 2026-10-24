@@ -1,4 +1,4 @@
-# Keet Bridge Protocol Specification v1.0
+# Keet Bridge Protocol Specification v1.1
 
 ## Overview
 
@@ -82,25 +82,44 @@ A message body is encoded with `compact-encoding` and followed by a detached
 
 | field | encoding | notes |
 | --- | --- | --- |
-| `version` | uint | `1` |
+| `version` | uint | `1` for text, `2` for text plus media |
 | `roomKey` | fixed 32 bytes | must equal the room key |
 | `messageId` | fixed 32 bytes | random per message; the duplicate key |
 | `sender` | fixed 32 bytes | Ed25519 identity public key |
 | `timestamp` | uint | milliseconds since the Unix epoch |
-| `text` | uint length + UTF-8 bytes | at most 4096 UTF-8 bytes |
+| `text` | uint length + UTF-8 bytes | caption; at most 4096 UTF-8 bytes |
+
+Version 2 appends exactly one media descriptor after `text`:
+
+| field | encoding | notes |
+| --- | --- | --- |
+| `mimeType` | uint length + UTF-8 bytes | `image/png`, `image/jpeg`, `image/webp`, or `image/gif` |
+| `size` | uint | decoded byte length, at most 10 MiB |
+| `sha256` | fixed 32 bytes | SHA-256 of the decoded bytes |
+| `bytes` | uint length + bytes | the decoded image bytes |
+
+A version-2 message has no separate media message type: the caption stays in
+`text` and carries the full message signature. Text-only messages remain
+version 1 so older peers can continue to exchange text. A decoder checks the
+message version before interpreting any later field; an unknown version is
+rejected as `UNSUPPORTED_VERSION` and is never reinterpreted as text.
 
 Decoding rejects truncated bodies, trailing bytes, a wrong room key, invalid
-UTF-8, oversized text, and a signature that does not verify against `sender`.
-A message is applied only when its writer has a member record and the recorded
-identity equals the message `sender`; otherwise it is discarded and logged.
-Malformed nodes and malformed message bodies are likewise discarded during
-apply and never crash the room.
+UTF-8, oversized text, an unknown MIME type, a MIME/magic-byte mismatch, a size
+or SHA-256 mismatch, media larger than 10 MiB, and a signature that does not
+verify against `sender`. Media is stored before the message is added to the
+view; any failure leaves no view entry and no `message` event. A message is
+applied only when its writer has a member record and the recorded identity
+equals the message `sender`; otherwise it is discarded and logged. Malformed
+nodes and malformed message bodies are likewise discarded during apply and
+never crash the room.
 
 ### Duplicate handling
 
 Message ids are deduplicated with a bounded FIFO that remembers the most recent
-10,000 ids. A duplicate message block is still appended to the `messages` view,
-but the room emits its `message` event only once.
+10,000 ids. A duplicate message block is recognized before media storage or view
+append, so the room stores no second copy and emits its `message` event only
+once.
 
 ### Zero-peer queue semantics
 
@@ -179,6 +198,16 @@ are untouched.
 | `decline_pairing` | `pairing_request_id` | resolved pairing record with `status: "declined"` |
 | `cancel_invite` | optional `invitation_id`; all invites when omitted | `cancelled` count |
 | `pairing_list` | none | `{ requests: [...] }` with pending and resolved records |
+| `acl_add` | `identity` (64 hex) | `identity`, `source: "runtime"`, `revoked: false` |
+| `acl_remove` | `identity` (64 hex) | `identity`, `source`, `revoked: true` |
+| `acl_list` | none | `identities`, `revoked` |
+
+The effective allowlist combines `KEET_ALLOWED_USERS`, the persisted
+`allowed.json` identities, and runtime `acl_add` entries, then subtracts
+`acl_remove` revocations. A revoked identity stays denied even when it appears
+in `KEET_ALLOWED_USERS`; `acl_add` clears that revocation. ACL mutations are
+persisted atomically before they are reflected in memory. `acl_list` reports
+the effective identities and the current revocation set.
 
 ### Events
 
@@ -215,9 +244,12 @@ A request line is:
 ```
 
 `request_id` is required and must be a non-empty string or a finite number. The
-bridge echoes it on the one terminal response for that request. Requests longer
-than 1 MiB, or lines that are not valid JSON, receive an `error` response with a
-`null` request id.
+bridge echoes it on the one terminal response for that request. A request line
+may be up to 21 MiB (the limit that accommodates a 10 MiB image after Base64
+encoding and JSON framing). A longer line receives `line_too_large`; the router
+extracts `request_id` from the first 64 KiB when possible, discards the rest of
+that line, and continues serving subsequent requests. Lines that are not valid
+JSON receive an `error` response with a `null` request id.
 
 `request_id` is reserved for correlation and is never passed to a command
 handler. To act on a pending pairing request, `accept_pairing` and
@@ -235,7 +267,7 @@ interleaving a terminal response with an event.
 
 `shutdown` awaits the protocol writer's `flush()` before exiting. The
 `shutdown_result` line is therefore delivered before the process exits even when
-the consumer is slow, while the existing 15-second force timer still bounds a
+the consumer is slow, while the 5-second shutdown deadline still bounds a
 consumer that never drains at all.
 
 ### Readiness
@@ -245,12 +277,12 @@ room, swarm, pairing listener, and first invite exist. Nothing is emitted before
 it except stderr diagnostics.
 
 ```json
-{"type":"welcome_room_ready","protocol_version":"1.0.0","identity":"644a4493bf85751f138a0a956129dac362b5f58a9141caf0b923ffb4532340d4","room_key":"7a08b58b2aa071c5078fe0e1166e39bbf5df6111934e3644d696ed2a19d764c4","invite_url":"keet://chat/yfowspfz9iowrptnnow5mc3xkpkk5ex5gd8gupemydxbkje5b9rd5cue4ciyanrtcdkj661wgstqwapzej3nmftroceknmh4e176h1kyc6kbsqio6az3atjsika3pdgk5gwpe88za6aewa3xsgrm74maz39ur6e","started_at":"2026-10-21T06:24:27.391Z","started_at_ms":1792563867391}
+{"type":"welcome_room_ready","protocol_version":"1.1.0","identity":"644a4493bf85751f138a0a956129dac362b5f58a9141caf0b923ffb4532340d4","room_key":"7a08b58b2aa071c5078fe0e1166e39bbf5df6111934e3644d696ed2a19d764c4","invite_url":"keet://chat/yfowspfz9iowrptnnow5mc3xkpkk5ex5gd8gupemydxbkje5b9rd5cue4ciyanrtcdkj661wgstqwapzej3nmftroceknmh4e176h1kyc6kbsqio6az3atjsika3pdgk5gwpe88za6aewa3xsgrm74maz39ur6e","started_at":"2026-10-21T06:24:27.391Z","started_at_ms":1792563867391}
 ```
 
 | field | type | meaning |
 | --- | --- | --- |
-| `protocol_version` | string | stdio protocol version, `1.0.0` |
+| `protocol_version` | string | stdio protocol version, `1.1.0` |
 | `identity` | 64-hex string | persistent Ed25519 identity public key |
 | `room_key` | 64-hex string | persisted Autobase room key |
 | `invite_url` | string or `null` | current `keet://chat/...` invite |
@@ -268,6 +300,7 @@ records; the snake_case names below are canonical.
 | command | request fields | result fields |
 | --- | --- | --- |
 | `send_message` | `text` (required, non-empty); optional `room_key` or `chat_id` | `message_id`, `room_key`, `chat_id`, `replicated_peers`, `queued`, `timestamp` |
+| `send_image` | `room_key`, `payload` = `{mime_type, base64_data, caption?}` (caption at most 4096 UTF-8 bytes) | `message_id`, `room_key`, `chat_id`, `mime_type`, `size`, `sha256`, `replicated_peers`, `queued`, `timestamp` |
 | `send_welcome` | `text` (or `message`), optional `room_key`/`chat_id` | same as `send_message` |
 | `status` | none | see below |
 | `get_identity` | none | `identity`, `public_key`, `room_key`, `writer_key`, `protocol_version` |
@@ -277,6 +310,9 @@ records; the snake_case names below are canonical.
 | `decline_pairing` | `pairing_request_id` | resolved pairing record, `status: "declined"` |
 | `cancel_invite` | optional `invitation_id`; omit to cancel the active invite | `cancelled`, `invitation_id`, `invite_url` |
 | `pairing_list` | none | `requests`, `pending`, `pending_count` |
+| `acl_add` | `identity` (64 hex) | `identity`, `source`, `revoked` |
+| `acl_remove` | `identity` (64 hex) | `identity`, `source`, `revoked` |
+| `acl_list` | none | `identities`, `revoked` |
 | `join_room` | `room_key` (or `chat_id`), 64 hex | `joined`, `status`, `room_key`, `peer_count`, `writable` |
 | `connect_to_user` | optional `room_key`/`chat_id` | `status`, `room_key`, `connected`, plus `join_room` fields when connected |
 | `shutdown` | none | `status: "stopped"`, `exit_code: 0` |
@@ -285,6 +321,25 @@ records; the snake_case names below are canonical.
 `queued: true` and `replicated_peers: 0`; the append is durable and replicates
 later. The bridge acknowledges only after the append is accepted, so
 `send_welcome` uses the same path.
+
+`send_image` accepts exactly one Base64-encoded image in `base64_data`. The
+decoded payload must be at most 10 MiB and its magic bytes must match one of
+`image/png`, `image/jpeg`, `image/webp`, or `image/gif`; the bridge derives the
+SHA-256 digest and byte length. The optional `caption` uses the same 4096-byte
+text limit. The command has a 60-second handler timeout so a large image can be
+validated, stored, and appended; other commands use the 10-second default.
+
+```json
+{"command":"send_image","request_id":"img-1","room_key":"7a08b58b2aa071c5078fe0e1166e39bbf5df6111934e3644d696ed2a19d764c4","payload":{"mime_type":"image/png","base64_data":"iVBORw0KGgo=","caption":"look"}}
+```
+
+```json
+{"type":"send_image_result","request_id":"img-1","message_id":"5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f","room_key":"7a08b58b2aa071c5078fe0e1166e39bbf5df6111934e3644d696ed2a19d764c4","chat_id":"7a08b58b2aa071c5078fe0e1166e39bbf5df6111934e3644d696ed2a19d764c4","mime_type":"image/png","size":8,"sha256":"4c4b6a3be1314ab86138bef4314dde022e600960d8689a2c8f8631802d20dab6","replicated_peers":0,"queued":true,"timestamp":1792563867391}
+```
+
+An invalid MIME type, malformed Base64, an empty payload, a payload over the
+limit, or a magic-byte mismatch returns a typed error before anything is
+appended to the room.
 
 `status` returns:
 
@@ -314,18 +369,21 @@ result's `joined` is `true` when the returned room key equals this bridge's acti
 room. `join_room` only accepts the persisted room; any other key returns
 `ROOM_NOT_PERSISTED` and the adapter should use `join_invite` with an invite.
 
-`shutdown` flushes storage, closes pairing, the room, and the swarm, writes the
-result, then exits `0`. Once shutdown starts the router stops reading stdin, so a
-second command is ignored. `SIGINT` and `SIGTERM` perform the same shutdown and
-also exit `0`; a forced exit after 15 seconds is an error path.
+`shutdown` flushes storage, closes delivery tracking, media temp files, pairing,
+the room, and the swarm, writes the terminal result, then exits `0`. The whole
+sequence is idempotent and has a 5-second deadline; a forced exit after that
+deadline is an error path. Once shutdown starts the router stops reading stdin,
+so a second command is ignored. `SIGINT` and `SIGTERM` perform the same shutdown
+and also exit `0`.
 
 ### Unsupported commands
 
-`send_image`, `send_file`, `send_attachment`, `send_voice`, and `send_video` are
-recognized but unsupported. They return a typed error and never touch the room:
+`send_file`, `send_attachment`, `send_voice`, `send_video`, and `send_animation`
+are recognized but unsupported. They return a typed error and never touch the
+room:
 
 ```json
-{"type":"error","request_id":"b6a1c0d4-3e2f-4a8b-9c7d-1e0f2a3b4c5d","code":"unsupported_command","message":"Command is not supported: send_image","operation":"send_image"}
+{"type":"error","request_id":"b6a1c0d4-3e2f-4a8b-9c7d-1e0f2a3b4c5d","code":"unsupported_command","message":"Command is not supported: send_animation","operation":"send_animation"}
 ```
 
 Any other command is also `unsupported_command`; the bridge never replies with an
@@ -341,8 +399,15 @@ Any other command is also `unsupported_command`; the bridge never replies with a
 | --- | --- |
 | `invalid_json` | request line is not JSON; `request_id` is `null` |
 | `invalid_request` | missing `command` or `request_id` |
-| `line_too_large` | request exceeds 1 MiB; `request_id` is `null` |
-| `timeout` | handler did not finish within the router timeout (10 s default) |
+| `line_too_large` | request exceeds 21 MiB; `request_id` is recovered from the first 64 KiB when possible, otherwise `null` |
+| `timeout` | handler did not finish within its timeout (10 s default, 60 s for `send_image`) |
+| `INVALID_MEDIA` | malformed media descriptor or invalid image payload |
+| `INVALID_MIME_TYPE` / `UNSUPPORTED_MIME_TYPE` | missing or unsupported image MIME type |
+| `EMPTY_MEDIA` | zero-byte or empty Base64 image payload |
+| `MEDIA_TOO_LARGE` | decoded image exceeds 10 MiB |
+| `MIME_MISMATCH` | magic bytes do not match the declared MIME type |
+| `DIGEST_MISMATCH` / `SIZE_MISMATCH` | digest or byte length does not match the image |
+| `INVALID_IDENTITY` | ACL command identity is not 64 hex characters |
 | `unsupported_command` | command is not implemented |
 | `command_failed` | unclassified handler failure |
 | `INVALID_TEXT` | empty `send_message` text |
@@ -373,7 +438,8 @@ JSON object.
 | `pairing_declined` | `request_id`, `invitation_id`, `identity`, `writer_key`, `status` (`declined` or `cancelled`), `reason` |
 | `pairing_expired` | `request_id`, `invitation_id`, `identity`, `writer_key`, `status: "expired"`, `reason: "expired"` |
 | `pairing_rejected` | `reason`, `message` |
-| `message` | `chat_id`, `room_key`, `message_id`, `from`, `sender`, `text`, `timestamp`, `ts` |
+| `message` | `chat_id`, `room_key`, `message_id`, `from`, `sender`, `text`, `timestamp`, `ts`, optional `media` |
+| `delivery_update` | `message_id`, `room_key`, `status` (`replicated` or `expired`), `peer_count`, `timestamp` |
 
 ```json
 {"type":"pairing_request","request_id":"9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b","invitation_id":"4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a0f9e8d7c6b5a4321","identity":"644a4493bf85751f138a0a956129dac362b5f58a9141caf0b923ffb4532340d4","writer_key":"7a08b58b2aa071c5078fe0e1166e39bbf5df6111934e3644d696ed2a19d764c4","display_name":"Alice","created_at":1792563867391,"expires_at":1792564167391,"status":"pending"}
@@ -385,6 +451,31 @@ JSON object.
 
 `message_id` is the deduplication key. `from` and `sender` are the same identity
 public key. `ts` is a millisecond timestamp kept for older adapters.
+
+A message carrying an image adds a `media` object. `path` is the absolute path
+inside `<KEET_DATA_DIR>/media/inbox`, and the adapter verifies the file's size
+and digest before emitting a photo event:
+
+```json
+{"type":"message","chat_id":"7a08b58b2aa071c5078fe0e1166e39bbf5df6111934e3644d696ed2a19d764c4","room_key":"7a08b58b2aa071c5078fe0e1166e39bbf5df6111934e3644d696ed2a19d764c4","message_id":"3d2c1b0a9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4","from":"644a4493bf85751f138a0a956129dac362b5f58a9141caf0b923ffb4532340d4","sender":"644a4493bf85751f138a0a956129dac362b5f58a9141caf0b923ffb4532340d4","text":"look","timestamp":1792563867391,"ts":1792563867391,"media":{"path":"/home/owner/.keet-channel/media/inbox/3d2c1b0a9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4.png","mime_type":"image/png","size":8,"sha256":"4c4b6a3be1314ab86138bef4314dde022e600960d8689a2c8f8631802d20dab6"}}
+```
+
+`delivery_update` is emitted only for sends acknowledged with `queued: true`.
+It reports that the append was later observed by at least one connected peer
+(`replicated`) or that the tracking window expired without a peer (`expired`).
+It is not a read receipt and never means the recipient displayed the message.
+
+`replicated` is an approximate observation: it means a peer connection existed
+after the local append, not that any particular block reached a particular
+recipient. The bridge does not receive per-message acknowledgements from peers,
+so neither status is a per-message delivery guarantee. `expired` only ends the
+local tracking window; the append is still durable and may replicate later. Each
+tracked message produces at most one terminal update, and shutdown clears all
+pending delivery timers and records.
+
+```json
+{"type":"delivery_update","message_id":"5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f","room_key":"7a08b58b2aa071c5078fe0e1166e39bbf5df6111934e3644d696ed2a19d764c4","status":"replicated","peer_count":1,"timestamp":1792563869999}
+```
 
 Pairing `reason` is `accepted`, `allowlisted`, or `allow_all` on confirmation and
 `declined`, `expired`, or `cancelled` on denial. `pairing_rejected` means the
@@ -404,6 +495,10 @@ possible; the candidate is denied.
 | `KEET_INVITE_FORMAT` | `keet` (default) or `standard` |
 | `KEET_PAIRING_TIMEOUT_MS` | pending request lifetime, default 5 minutes |
 | `KEET_PAIRING_JOIN_TIMEOUT_MS` | candidate join timeout |
+| `KEET_MEDIA_MAX_FILES` | inbox file cap, default 512 |
+| `KEET_MEDIA_MAX_AGE_MS` | inbox age limit in milliseconds, default 7 days |
+| `KEET_DELIVERY_TTL_MS` | queued-send tracking window, default 60 seconds |
+| `KEET_DELIVERY_MAX_PENDING` | queued-send tracker capacity, default 1024 |
 
 The bridge runs under Node.js 24 or newer. It does not use the Pear/Bare runtime
 and has no WebSocket listener; the only adapter transport is stdio.

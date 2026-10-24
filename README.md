@@ -1,15 +1,17 @@
-<h1 align="center">🚧&nbsp; WORK IN PROGRESS &nbsp;🚧</h1>
+<h1 align="center">Keet Channel 1.0</h1>
 
 <p align="center">
-  <img alt="status: alpha — not production ready" src="https://img.shields.io/badge/STATUS-ALPHA%20%C2%B7%20NOT%20PRODUCTION--READY-orange?style=for-the-badge">
+  <img alt="status: not working with official Keet client" src="https://img.shields.io/badge/STATUS-1.0%20%C2%B7%20NOT%20WORKING%20WITH%20OFFICIAL%20KEET-red?style=for-the-badge">
 </p>
 
-> [!CAUTION]
-> **This project is under active development and is not ready for production use.**
+> [!NOTE]
+> Version 1.0 adds images, runtime ACL management, delivery updates, and a bounded
+> 5-second shutdown. Protocol version is `1.1.0`. Text-only peers keep working;
+> media is exchanged only with peers that understand the version-2 message body.
+> The closed Keet app chat schema is still out of scope — see
+> [docs/protocol-compatibility.md](docs/protocol-compatibility.md).
 >
-> Interfaces, configuration, the wire protocol, and on-disk data formats may change
-> without notice and without migration paths. Use it for evaluation, experiments, and
-> development only — do not rely on it for real traffic or important data yet.
+> **Cannot connect to the official Keet client:** Keet is closed-source and uses a different set of HyperDHT bootstrap nodes than the defaults used by this bridge. As a result, peers from this plugin and the official Keet desktop app cannot discover each other over the DHT, so live pairing with the official client is not possible. The bridge implementation itself is correct, but it cannot fulfill its stated goal of connecting to the official Keet messenger.
 
 ---
 
@@ -27,8 +29,13 @@ adapter.py  ──stdin/stdout JSON──▶  bridge/index.js
                                       │
                                       ├── blind-pairing 2.3.1 (invites, member/candidate)
                                       ├── Autobase 7.28.2 + Corestore 7.15.0 (room)
+                                      ├── media store (atomic inbox, 10 MiB images)
+                                      ├── delivery tracker (bounded update timers)
                                       └── Hyperswarm 4.17.2 (DHT + replication)
 ```
+
+Text and images (PNG, JPEG, WebP, GIF up to 10 MiB decoded) share the same
+encrypted Autobase room.
 
 The bridge runs as a plain **Node.js** process. Pear/Bare is not used and is not
 required.
@@ -70,8 +77,20 @@ export KEET_ALLOWED_USERS="<64-hex-identity>,<64-hex-identity>"
 
 Pairing acceptance writes the candidate's stable identity to
 `<KEET_DATA_DIR>/allowed.json`; both the bridge and the adapter enforce it after a
-restart. `KEET_ALLOW_ALL_USERS=true` is a development-only override that logs a
-warning and is never persisted.
+restart. The ACL can be changed while the bridge is running:
+
+```text
+acl_add     {identity, request_id}
+acl_remove  {identity, request_id}
+acl_list    {request_id}
+```
+
+`allowed.json` version 2 stores `{version, identities, revoked}`. A revoked
+identity stays revoked even if it is listed in `KEET_ALLOWED_USERS`; re-adding it
+through `acl_add` clears the revocation. Persistence happens atomically before
+the in-memory policy changes, so a failed write leaves the old policy in place.
+`KEET_ALLOW_ALL_USERS=true` is a development-only override that logs a warning
+and is never persisted.
 
 See [docs/access-control.md](docs/access-control.md) for the full policy and
 [docs/data-directory.md](docs/data-directory.md) for identity/room storage and
@@ -89,7 +108,16 @@ backup.
 | `KEET_DHT_BOOTSTRAP` | Comma-separated `host:port` DHT bootstrap nodes | public DHT |
 | `KEET_INVITE_FORMAT` | `keet` (`keet://chat/...`) or `standard` | `keet` |
 | `KEET_PAIRING_TIMEOUT_MS` | Pending pairing request lifetime | 5 minutes |
+| `KEET_MEDIA_MAX_FILES` | Inbound inbox retention, file count | `512` |
+| `KEET_MEDIA_MAX_AGE_MS` | Inbound inbox retention, age | 7 days |
+| `KEET_DELIVERY_TTL_MS` | Queued-delivery update TTL | `60000` |
+| `KEET_DELIVERY_MAX_PENDING` | Maximum tracked queued sends | `1024` |
 | `KEET_NODE_PATH` | Explicit Node.js binary | `node` on `PATH` |
+
+Inbound images are written to `<KEET_DATA_DIR>/media/inbox` with `0700`
+directory and `0600` file permissions. The bridge accepts at most 10 MiB of
+decoded image data and caps one stdio line at 21 MiB to cover Base64 overhead.
+At most two media transfers run concurrently.
 
 ## Protocol
 
@@ -99,20 +127,24 @@ unique `request_id`, and every terminal response echoes it exactly once.
 Supported commands:
 
 ```text
-send_message   status          get_identity   create_invite
-join_invite    accept_pairing  decline_pairing cancel_invite
-pairing_list   join_room       connect_to_user send_welcome
+send_message   send_image      status          get_identity
+create_invite  join_invite     accept_pairing  decline_pairing
+cancel_invite  pairing_list    acl_add         acl_remove
+acl_list       join_room       connect_to_user send_welcome
 shutdown
 ```
 
-`send_image`, `send_file`, `send_attachment`, `send_voice`, and `send_video`
-return a typed `unsupported_command` error. **Attachments are not implemented**;
-only text messages are supported.
+`send_image` takes `{mime_type, base64_data, caption?}`. MIME type is verified
+against magic bytes, Base64 must be canonical, and the decoded size is capped at
+10 MiB. `send_file`, `send_attachment`, `send_voice`, `send_video`, and
+`send_animation` remain typed `unsupported_command` errors.
 
-`send_message` and `send_welcome` acknowledge only after the local Autobase append
-is durable. With no connected peer the result has `queued: true` and
-`replicated_peers: 0`; the entry replicates when a peer connects. Full request,
-response, event, error, and readiness schemas are in
+`send_message`, `send_welcome`, and `send_image` acknowledge only after the local
+Autobase append is durable. With no connected peer the result has `queued: true`
+and `replicated_peers: 0`; the entry replicates when a peer connects. For such
+sends the bridge emits one terminal `delivery_update` (`replicated` or `expired`).
+Replication means a peer was observed after the append — it is **not** a read
+receipt. Full request, response, event, error, and readiness schemas are in
 [docs/protocol.md](docs/protocol.md).
 
 ## Cron and standalone delivery
@@ -135,8 +167,9 @@ disconnected, fails pending requests, and restarts with backoff
 or startup exit also schedules the next attempt instead of ending supervision.
 Backoff resets after 60 seconds of stable readiness. `connect()` and
 `disconnect()` are serialized; a disconnect during startup aborts the start and
-later connects can start a fresh bridge. `disconnect()` sends `shutdown`, waits
-up to 15 seconds, force-kills if necessary, and suppresses restarts.
+later connects can start a fresh bridge. `disconnect()` sends `shutdown` and
+waits up to 5 seconds for the process to exit, then escalates to `terminate` and
+finally `kill`; it suppresses restarts and fails any pending requests.
 
 The same data directory restores the identity, room key, allowlist, and history.
 Only one bridge may open a data directory at a time.
@@ -152,11 +185,20 @@ python -m pip install -r requirements-dev.txt
 python -m pytest tests/ -q
 
 # OpenSpec change validation
-openspec validate make-keet-channel-interoperable --strict
+openspec validate production-ready-v1 --strict
+
+# Live interop test (requires live Keet 4.24.0 client + human; not part of npm test)
+# See docs/live-testing.md; writes live-test-report.json beside the data dir
+node scripts/live-test.js --pairing-timeout 120 --cleanup-data
+
+# Short soak smoke; see docs/soak-test.md for the 48-hour run
+node scripts/soak.js --duration 10 --interval 1 --cleanup-data
 ```
 
 Bridge tests use a loopback DHT and never contact a public network or live Keet
-client.
+client. The live test (`scripts/live-test.js` / `docs/live-testing.md`) is the
+only operator-facing automation that contacts a real Keet client; it is not
+included in `npm test`, CI, or `soak.js`.
 
 ## Breaking changes from 0.1
 
@@ -165,7 +207,8 @@ client.
 - `KEET_HOME_CHANNEL` is now the stable room key, not a discovery key.
 - `KEET_INVITE_URL`, stderr scraping, the WebSocket/port-5335 transport, and the
   Pear runtime path were removed.
-- Image sending is reported as unsupported instead of silently succeeding.
+- Images are supported in 1.0; files, voice, video, and animations stay
+  unsupported instead of failing silently.
 - Access is denied by default; unset `KEET_ALLOWED_USERS` no longer means
   allow-all.
 
@@ -175,4 +218,5 @@ client.
 - [docs/protocol-compatibility.md](docs/protocol-compatibility.md) — Keet 4.24.0 baseline
 - [docs/data-directory.md](docs/data-directory.md) — storage, backup, restart
 - [docs/access-control.md](docs/access-control.md) — allowlist and pairing
+- [docs/soak-test.md](docs/soak-test.md) — 48-hour resource soak
 - [SPEC.md](SPEC.md) — implementation specification

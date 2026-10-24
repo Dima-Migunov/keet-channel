@@ -21,13 +21,14 @@ const { KEY_BYTES, isKeyHex, normalizeKey } = require('./keys')
 
 const PAIRING_VERSION = 1
 const USER_DATA_VERSION = 1
-const ALLOWLIST_VERSION = 1
+const ALLOWLIST_VERSION = 2
 const MAX_USER_DATA_BYTES = 1024
 const MAX_DISPLAY_NAME_BYTES = 256
 const DEFAULT_PENDING_TIMEOUT_MS = 5 * 60 * 1000
 const DEFAULT_JOIN_TIMEOUT_MS = 60 * 1000
 const DEFAULT_CHECK_INTERVAL_MS = 1000
 const MAX_PAIRING_HISTORY = 200
+const MAX_PAIRING_REQUESTS = 128
 
 const PairingError = createErrorClass('PairingError')
 
@@ -154,69 +155,115 @@ function resolveAclFile (opts = {}) {
   return null
 }
 
-function normalizeAllowlist (value, file) {
-  const records = Array.isArray(value)
-    ? value
-    : value && typeof value === 'object' && Array.isArray(value.identities)
-      ? value.identities
-      : null
+function normalizeAclState (value, file) {
+  let identities
+  let revoked = []
 
-  if (records === null) {
+  if (Array.isArray(value)) {
+    identities = value
+  } else if (value && typeof value === 'object' && Array.isArray(value.identities)) {
+    if (value.version !== undefined && value.version !== 1 && value.version !== ALLOWLIST_VERSION) {
+      throw new StorageError(
+        'INVALID_ALLOWLIST',
+        `Invalid allowlist at ${file}: unsupported version ${value.version}`
+      )
+    }
+    identities = value.identities
+    if (value.revoked !== undefined) {
+      if (!Array.isArray(value.revoked)) {
+        throw new StorageError(
+          'INVALID_ALLOWLIST',
+          `Invalid allowlist at ${file}: revoked must be an array`
+        )
+      }
+      revoked = value.revoked
+    }
+  } else {
     throw new StorageError(
       'INVALID_ALLOWLIST',
       `Invalid allowlist at ${file}: expected an identities array`
     )
   }
 
-  const identities = []
+  const allowed = []
+  const denied = []
 
-  for (const record of records) {
-    if (isKeyHex(record) && !identities.includes(record)) identities.push(record)
+  for (const record of identities) {
+    if (isKeyHex(record) && !allowed.includes(record)) allowed.push(record)
+  }
+  for (const record of revoked) {
+    if (isKeyHex(record) && !denied.includes(record)) denied.push(record)
   }
 
-  return identities
+  return {
+    identities: allowed.sort(),
+    revoked: denied.sort()
+  }
 }
 
-function loadAllowedIdentities (opts = {}) {
+function loadAcl (opts = {}) {
   const file = resolveAclFile(opts)
 
-  if (file === null) return []
+  if (file === null) return { identities: [], revoked: [] }
 
   let value
 
   try {
     value = readJsonFile(file, 'allowlist')
   } catch (err) {
-    if (err.code === 'ENOENT') return []
+    if (err.code === 'ENOENT') return { identities: [], revoked: [] }
     throw err
   }
 
-  return normalizeAllowlist(value, file)
+  return normalizeAclState(value, file)
 }
 
-function saveAllowedIdentities (identities, opts = {}) {
+function saveAcl (state, opts = {}) {
   const file = resolveAclFile(opts)
 
   if (file === null) {
     throw new PairingError('ACL_FILE_REQUIRED', 'an allowlist file path or data directory is required')
   }
 
+  const normalized = normalizeAclState(
+    {
+      version: ALLOWLIST_VERSION,
+      identities: Array.isArray(state) ? state : state && state.identities,
+      revoked: state && !Array.isArray(state) ? state.revoked || [] : []
+    },
+    file
+  )
+
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
-
-  const current = loadAllowedIdentities({ aclFile: file })
-  const merged = [...current]
-
-  for (const identity of identities) {
-    const hex = toKey(identity, 'identityKey').toString('hex')
-    if (!merged.includes(hex)) merged.push(hex)
-  }
-
-  merged.sort()
-
-  writeJsonAtomic(file, { version: ALLOWLIST_VERSION, identities: merged })
+  writeJsonAtomic(file, {
+    version: ALLOWLIST_VERSION,
+    identities: normalized.identities,
+    revoked: normalized.revoked
+  })
   ensureMode(file, 0o600)
 
-  return merged
+  return normalized
+}
+
+function loadAllowedIdentities (opts = {}) {
+  return loadAcl(opts).identities
+}
+
+function saveAllowedIdentities (identities, opts = {}) {
+  const current = loadAcl(opts)
+  const next = new Set(current.identities)
+
+  for (const identity of identities) {
+    next.add(toKey(identity, 'identityKey').toString('hex'))
+  }
+
+  return saveAcl(
+    {
+      identities: [...next],
+      revoked: current.revoked
+    },
+    opts
+  ).identities
 }
 
 function publicRequest (entry) {
@@ -281,7 +328,11 @@ class Pairing extends EventEmitter {
     this._timer = null
     this._closed = false
     this._allowAllWarned = false
+    this._configured = new Set()
+    this._persisted = new Set()
+    this._revoked = new Set()
     this._allowed = new Set()
+    this._aclQueue = Promise.resolve()
     this._releasedCandidates = new WeakSet()
 
     this._loadAllowed(opts.allowedUsers !== undefined ? opts.allowedUsers : env.KEET_ALLOWED_USERS)
@@ -314,16 +365,28 @@ class Pairing extends EventEmitter {
       this.log(`ignoring invalid KEET_ALLOWED_USERS entry: ${JSON.stringify(entry).slice(0, 80)}`)
     }
 
-    let persisted = []
+    let persisted = { identities: [], revoked: [] }
 
     try {
-      persisted = loadAllowedIdentities({ aclFile: this.aclFile, dataDir: this.dataDir })
+      persisted = loadAcl({ aclFile: this.aclFile, dataDir: this.dataDir })
     } catch (err) {
       this.log(`could not load the persisted allowlist: ${err.message}`)
     }
 
-    this._allowed = new Set([...persisted, ...identities])
+    this._configured = new Set(identities)
+    this._persisted = new Set(persisted.identities)
+    this._revoked = new Set(persisted.revoked)
+    this._rebuildAllowed()
     return this._allowed
+  }
+
+  _rebuildAllowed () {
+    const allowed = new Set([...this._configured, ...this._persisted])
+
+    for (const identity of this._revoked) allowed.delete(identity)
+
+    this._allowed = allowed
+    return allowed
   }
 
   reloadAllowed () {
@@ -332,6 +395,119 @@ class Pairing extends EventEmitter {
 
   isAllowed (identityKey) {
     return this._allowed.has(toKey(identityKey, 'identityKey').toString('hex'))
+  }
+
+  _enqueueAcl (operation) {
+    const run = this._aclQueue.then(operation, operation)
+
+    this._aclQueue = run.then(
+      () => undefined,
+      () => undefined
+    )
+
+    return run
+  }
+
+  _aclIdentity (value) {
+    try {
+      return toKey(value, 'identityKey').toString('hex')
+    } catch (err) {
+      throw new PairingError('INVALID_IDENTITY', err.message)
+    }
+  }
+
+  _aclEntry (identity) {
+    const revoked = this._revoked.has(identity)
+    const configured = this._configured.has(identity)
+
+    return {
+      identity,
+      source: configured ? 'config' : 'runtime',
+      revoked,
+      authorized: !revoked && this._allowed.has(identity)
+    }
+  }
+
+  _aclSnapshot () {
+    const known = new Set([...this._configured, ...this._persisted, ...this._revoked])
+    const entries = [...known].sort().map((identity) => this._aclEntry(identity))
+
+    return {
+      entries,
+      identities: [...this._allowed].sort(),
+      revoked: [...this._revoked].sort(),
+      count: this._allowed.size
+    }
+  }
+
+  _saveAclState (identities, revoked) {
+    try {
+      saveAcl({ identities, revoked }, { aclFile: this.aclFile })
+    } catch (err) {
+      const error = new PairingError(
+        'ACL_PERSIST_FAILED',
+        `could not persist the allowlist: ${err.message}`
+      )
+      error.cause = err
+      throw error
+    }
+  }
+
+  async aclAdd (value) {
+    const identity = this._aclIdentity(value)
+
+    return this._enqueueAcl(async () => {
+      const identities = new Set(this._persisted)
+      const revoked = new Set(this._revoked)
+
+      identities.add(identity)
+      revoked.delete(identity)
+      this._saveAclState([...identities].sort(), [...revoked].sort())
+
+      this._persisted = identities
+      this._revoked = revoked
+      this._rebuildAllowed()
+
+      return this._aclEntry(identity)
+    })
+  }
+
+  async aclRemove (value) {
+    const identity = this._aclIdentity(value)
+
+    return this._enqueueAcl(async () => {
+      const identities = new Set(this._persisted)
+      const revoked = new Set(this._revoked)
+
+      identities.delete(identity)
+      revoked.add(identity)
+      this._saveAclState([...identities].sort(), [...revoked].sort())
+
+      this._persisted = identities
+      this._revoked = revoked
+      this._rebuildAllowed()
+
+      return this._aclEntry(identity)
+    })
+  }
+
+  async aclList () {
+    return this._enqueueAcl(async () => this._aclSnapshot())
+  }
+
+  async _persistApproved (identity) {
+    return this._enqueueAcl(async () => {
+      const identities = new Set(this._persisted)
+      const revoked = new Set(this._revoked)
+
+      identities.add(identity)
+      revoked.delete(identity)
+      this._saveAclState([...identities].sort(), [...revoked].sort())
+
+      this._persisted = identities
+      this._revoked = revoked
+      this._rebuildAllowed()
+    })
   }
 
   async start (opts = {}) {
@@ -625,7 +801,7 @@ class Pairing extends EventEmitter {
       })
     }
 
-    if (this.allowAll) {
+    if (this.allowAll && !this._revoked.has(entry.identity)) {
       this._warnAllowAll()
       return this._confirm(request, entry, {
         persist: false,
@@ -663,8 +839,7 @@ class Pairing extends EventEmitter {
 
     if (opts.persist) {
       try {
-        saveAllowedIdentities([entry.identity], { aclFile: this.aclFile })
-        this._allowed.add(entry.identity)
+        await this._persistApproved(entry.identity)
       } catch (err) {
         this.log(`could not persist the accepted identity: ${err.message}`)
       }
@@ -941,6 +1116,8 @@ module.exports = {
   decodeUserData,
   parseAllowedUsers,
   resolveAclFile,
+  loadAcl,
+  saveAcl,
   loadAllowedIdentities,
   saveAllowedIdentities
 }

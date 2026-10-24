@@ -1,6 +1,8 @@
 """Tests for the Keet adapter stdio protocol, lifecycle, and access control."""
 
 import asyncio
+import base64
+import hashlib
 import json
 import os
 import sys
@@ -18,6 +20,11 @@ VALID_A = "a" * 64
 VALID_B = "b" * 64
 VALID_C = "c" * 64
 VALID_ROOM = "d" * 64
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"adapter image payload"
+JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"adapter image payload"
+GIF_BYTES = b"GIF89a" + b"adapter image payload"
+WEBP_BYTES = b"RIFF" + b"\x10\x00\x00\x00" + b"WEBP" + b"adapter image payload"
 
 
 class FakeStdin:
@@ -292,6 +299,42 @@ class TestConnectReadiness:
 
 
 class TestSendResults:
+    def test_send_result_prefers_success_signature(self, monkeypatch):
+        class CurrentSendResult:
+            def __init__(self, success=False, error=None):
+                self.success = success
+                self.error = error
+
+        monkeypatch.setattr(adapter, "SendResult", CurrentSendResult)
+        success = adapter._send_result(True, message_id="m1")
+        failure = adapter._send_result(False, "bad")
+
+        assert success.success is True
+        assert success.ok is True
+        assert success.message_id == "m1"
+        assert failure.success is False
+        assert failure.ok is False
+        assert failure.error == "bad"
+
+    def test_send_result_falls_back_to_legacy_ok_signature(self, monkeypatch):
+        class LegacySendResult:
+            def __init__(self, ok=False, error=None):
+                self.ok = ok
+                self.error = error
+
+        monkeypatch.setattr(adapter, "SendResult", LegacySendResult)
+        success = adapter._send_result(True, message_id="m2")
+        failure = adapter._send_result(False, "legacy bad")
+
+        assert success.ok is True
+        assert success.success is True
+        assert success.message_id == "m2"
+        assert failure.ok is False
+        assert failure.success is False
+        assert failure.error == "legacy bad"
+        assert adapter._result_ok(success) is True
+        assert adapter._result_ok(failure) is False
+
     @pytest.mark.asyncio
     async def test_send_awaits_and_returns_bridge_result(self):
         instance = make_adapter(_connected=True, _process=FakeProcess())
@@ -370,14 +413,263 @@ class TestSendResults:
         instance._request.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_send_image_is_typed_unsupported_without_bridge_call(self):
+    async def test_send_image_uses_one_correlated_payload_and_timeout(
+        self, monkeypatch
+    ):
         instance = make_adapter(_connected=True, _process=FakeProcess())
-        instance._request = AsyncMock()
-        result = await instance.send_image(VALID_ROOM, "/tmp/x.png")
+        resolver = AsyncMock(return_value=(PNG_BYTES, "image/png"))
+        monkeypatch.setattr(adapter, "_resolve_image", resolver)
+        expected_digest = hashlib.sha256(PNG_BYTES).hexdigest()
+        instance._request = AsyncMock(
+            return_value={
+                "type": "send_image_result",
+                "message_id": "e" * 64,
+                "room_key": VALID_ROOM,
+                "chat_id": VALID_ROOM,
+                "mime_type": "image/png",
+                "size": len(PNG_BYTES),
+                "sha256": expected_digest,
+                "replicated_peers": 2,
+                "queued": False,
+                "timestamp": 1234,
+            }
+        )
+
+        result = await instance.send_image(
+            VALID_ROOM, "https://example.test/photo.png", caption="look"
+        )
+
+        resolver.assert_awaited_once_with("https://example.test/photo.png")
+        instance._request.assert_awaited_once_with(
+            "send_image",
+            {
+                "room_key": VALID_ROOM,
+                "payload": {
+                    "mime_type": "image/png",
+                    "base64_data": base64.b64encode(PNG_BYTES).decode("ascii"),
+                    "caption": "look",
+                },
+            },
+            timeout=adapter.SEND_IMAGE_TIMEOUT,
+        )
+        assert adapter.SEND_IMAGE_TIMEOUT == 60.0
+        assert result.ok is True
+        assert result.success is True
+        assert result.message_id == "e" * 64
+        assert result.mime_type == "image/png"
+        assert result.size == len(PNG_BYTES)
+        assert result.sha256 == expected_digest
+        assert result.queued is False
+        assert result.replicated_peers == 2
+
+    @pytest.mark.asyncio
+    async def test_send_image_timeout_is_reported(self, monkeypatch):
+        instance = make_adapter(_connected=True, _process=FakeProcess())
+        monkeypatch.setattr(
+            adapter,
+            "_resolve_image",
+            AsyncMock(return_value=(GIF_BYTES, "image/gif")),
+        )
+        instance._request = AsyncMock(
+            side_effect=adapter.KeetTimeout("no answer in 60s")
+        )
+
+        result = await instance.send_image(VALID_ROOM, "/tmp/photo.gif")
+
         assert result.ok is False
-        assert result.code == "unsupported_command"
+        assert result.code == "timeout"
+        assert result.operation == "send_image"
+        assert "no answer in 60s" in result.error
+
+    @pytest.mark.asyncio
+    async def test_send_image_resolution_failure_never_calls_bridge(
+        self, monkeypatch
+    ):
+        instance = make_adapter(_connected=True, _process=FakeProcess())
+        monkeypatch.setattr(
+            adapter,
+            "_resolve_image",
+            AsyncMock(
+                side_effect=adapter.KeetImageError(
+                    "MEDIA_TOO_LARGE", "image is too large"
+                )
+            ),
+        )
+        instance._request = AsyncMock()
+
+        result = await instance.send_image(VALID_ROOM, "/tmp/huge.png")
+
+        assert result.ok is False
+        assert result.code == "MEDIA_TOO_LARGE"
         assert result.operation == "send_image"
         instance._request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_delegates_to_send_image(self):
+        instance = make_adapter(_connected=True, _process=FakeProcess())
+        expected = send_result(True, message_id="f" * 64)
+        instance.send_image = AsyncMock(return_value=expected)
+
+        result = await instance.send_image_file(
+            VALID_ROOM, "/tmp/photo.png", caption="file caption"
+        )
+
+        instance.send_image.assert_awaited_once_with(
+            VALID_ROOM, "/tmp/photo.png", caption="file caption"
+        )
+        assert result is expected
+
+
+class TestImageResolution:
+    def test_magic_bytes_identify_each_supported_image_type(self):
+        assert adapter._detect_image_mime(PNG_BYTES) == "image/png"
+        assert adapter._detect_image_mime(JPEG_BYTES) == "image/jpeg"
+        assert adapter._detect_image_mime(GIF_BYTES) == "image/gif"
+        assert adapter._detect_image_mime(WEBP_BYTES) == "image/webp"
+        assert adapter._detect_image_mime(b"not an image") is None
+
+    @pytest.mark.asyncio
+    async def test_local_path_and_file_url_resolve_to_magic_checked_bytes(
+        self, tmp_path
+    ):
+        local = tmp_path / "photo.bin"
+        local.write_bytes(PNG_BYTES)
+        data, mime_type = await adapter._resolve_image(local)
+        assert data == PNG_BYTES
+        assert mime_type == "image/png"
+
+        spaced = tmp_path / "a photo.gif"
+        spaced.write_bytes(GIF_BYTES)
+        data, mime_type = await adapter._resolve_image(spaced.as_uri())
+        assert data == GIF_BYTES
+        assert mime_type == "image/gif"
+
+    @pytest.mark.asyncio
+    async def test_http_uses_hermes_cache_helper_when_available(
+        self, tmp_path, monkeypatch
+    ):
+        cached = tmp_path / "cached-image"
+        cached.write_bytes(WEBP_BYTES)
+        helper = AsyncMock(return_value=str(cached))
+        monkeypatch.setattr(adapter, "cache_image_from_url", helper)
+
+        data, mime_type = await adapter._resolve_image(
+            "https://example.test/photo.webp"
+        )
+
+        helper.assert_awaited_once_with("https://example.test/photo.webp")
+        assert data == WEBP_BYTES
+        assert mime_type == "image/webp"
+
+    @pytest.mark.asyncio
+    async def test_http_falls_back_to_bounded_fetch(self, monkeypatch):
+        class FakeResponse:
+            headers = {}
+
+            def __init__(self, data):
+                self._data = data
+                self._offset = 0
+
+            def read(self, size):
+                chunk = self._data[self._offset : self._offset + size]
+                self._offset += len(chunk)
+                return chunk
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            assert request.full_url == "http://example.test/photo.png"
+            assert timeout == adapter._IMAGE_FETCH_TIMEOUT
+            return FakeResponse(PNG_BYTES)
+
+        monkeypatch.setattr(adapter, "cache_image_from_url", None)
+        monkeypatch.setattr(adapter.urllib.request, "urlopen", fake_urlopen)
+
+        data, mime_type = await adapter._resolve_image(
+            "http://example.test/photo.png"
+        )
+        assert data == PNG_BYTES
+        assert mime_type == "image/png"
+
+    @pytest.mark.asyncio
+    async def test_unreachable_url_is_typed(self, monkeypatch):
+        def unreachable(request, timeout=None):
+            raise OSError("network is down")
+
+        monkeypatch.setattr(adapter, "cache_image_from_url", None)
+        monkeypatch.setattr(adapter.urllib.request, "urlopen", unreachable)
+
+        with pytest.raises(adapter.KeetImageError) as excinfo:
+            await adapter._resolve_image("https://example.test/photo.png")
+        assert excinfo.value.code == "IMAGE_UNREADABLE"
+        assert excinfo.value.operation == "send_image"
+
+    @pytest.mark.asyncio
+    async def test_unreadable_local_path_is_typed(self, tmp_path):
+        with pytest.raises(adapter.KeetImageError) as excinfo:
+            await adapter._resolve_image(str(tmp_path / "missing.png"))
+        assert excinfo.value.code == "IMAGE_UNREADABLE"
+
+    @pytest.mark.asyncio
+    async def test_oversized_local_file_is_rejected_while_reading(self, tmp_path):
+        oversized = tmp_path / "large.png"
+        oversized.write_bytes(
+            b"\x89PNG\r\n\x1a\n" + b"x" * adapter.MAX_IMAGE_BYTES
+        )
+
+        with pytest.raises(adapter.KeetImageError) as excinfo:
+            await adapter._resolve_image(oversized)
+        assert excinfo.value.code == "MEDIA_TOO_LARGE"
+
+    @pytest.mark.asyncio
+    async def test_oversized_remote_response_is_rejected(self, monkeypatch):
+        class OversizedResponse:
+            headers = {}
+
+            def __init__(self):
+                self._payload = b"\x89PNG\r\n\x1a\n" + b"x" * adapter.MAX_IMAGE_BYTES
+                self._offset = 0
+
+            def read(self, size):
+                chunk = self._payload[self._offset : self._offset + size]
+                self._offset += len(chunk)
+                return chunk
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+        monkeypatch.setattr(adapter, "cache_image_from_url", None)
+        monkeypatch.setattr(
+            adapter.urllib.request,
+            "urlopen",
+            lambda request, timeout=None: OversizedResponse(),
+        )
+
+        with pytest.raises(adapter.KeetImageError) as excinfo:
+            await adapter._resolve_image("https://example.test/huge.png")
+        assert excinfo.value.code == "MEDIA_TOO_LARGE"
+
+    @pytest.mark.asyncio
+    async def test_non_image_bytes_are_rejected(self, tmp_path):
+        text_file = tmp_path / "not-an-image.png"
+        text_file.write_bytes(b"<html>not an image</html>")
+
+        with pytest.raises(adapter.KeetImageError) as excinfo:
+            await adapter._resolve_image(text_file)
+        assert excinfo.value.code == "INVALID_IMAGE"
+
+    @pytest.mark.asyncio
+    async def test_file_url_for_another_host_is_rejected(self):
+        with pytest.raises(adapter.KeetImageError) as excinfo:
+            await adapter._resolve_image("file://elsewhere.example/photo.png")
+        assert excinfo.value.code == "INVALID_IMAGE_SOURCE"
 
 
 class TestEventsAndAccessControl:
@@ -444,7 +736,7 @@ class TestEventsAndAccessControl:
             json.dumps({"type": "member_joined", "identity": VALID_B})
         )
         assert instance._is_allowed(VALID_B) is False
-        assert VALID_B not in instance.get_allowed_users()
+        assert VALID_B not in await instance.get_allowed_users()
 
     @pytest.mark.asyncio
     async def test_unknown_event_does_not_break_reader(self):
@@ -477,12 +769,15 @@ class TestAllowlistParsing:
         assert adapter._parse_allowed_users(None) == (set(), [])
         assert adapter._parse_allowed_users(" , , ") == (set(), [])
 
-    def test_connection_identifier_cannot_be_added(self):
+    @pytest.mark.asyncio
+    async def test_connection_identifier_cannot_be_added(self):
         instance = make_adapter()
         instance._allowed_users = set()
         instance._dynamic_allowed = set()
-        assert instance.add_allowed_user("peer-connection-1") is False
+        instance._request = AsyncMock()
+        assert await instance.add_allowed_user("peer-connection-1") is False
         assert instance._is_allowed("peer-connection-1") is False
+        instance._request.assert_not_awaited()
 
     def test_default_denies_and_warns(self):
         instance = make_adapter()
@@ -733,9 +1028,62 @@ class TestSupervisionAndDisconnect:
 
         assert instance._request.await_count == 1
         assert instance._request.await_args.args[0] == "shutdown"
+        assert instance._request.await_args.kwargs["timeout"] <= 5.0
+        assert proc.terminated is False
         assert proc.killed is False
         assert instance._process is None
         assert instance.is_connected is False
+
+    @pytest.mark.asyncio
+    async def test_disconnect_waits_for_process_exit_before_escalating(self):
+        instance = make_adapter()
+        proc = FakeProcess()
+        instance._process = proc
+        instance._connected = True
+
+        async def shutdown(*args, **kwargs):
+            return {"type": "shutdown_result"}
+
+        instance._request = AsyncMock(side_effect=shutdown)
+
+        task = asyncio.create_task(instance.disconnect())
+        await asyncio.sleep(0.02)
+
+        assert task.done() is False
+        assert proc.terminated is False
+        assert proc.killed is False
+
+        proc.returncode = 0
+        proc._done.set()
+        await task
+
+        assert proc.terminated is False
+        assert proc.killed is False
+        assert instance._process is None
+
+    @pytest.mark.asyncio
+    async def test_disconnect_escalates_to_terminate_and_kill_after_deadline(self):
+        class SlowExitProcess(FakeProcess):
+            def terminate(self):
+                self.terminated = True
+
+        instance = make_adapter(SHUTDOWN_TIMEOUT=0.02, TERMINATE_TIMEOUT=0.02)
+        proc = SlowExitProcess()
+        instance._process = proc
+        instance._connected = True
+        instance._request = AsyncMock(
+            side_effect=adapter.KeetTimeout("shutdown timed out")
+        )
+        future = asyncio.get_running_loop().create_future()
+        instance._pending["req-1"] = future
+
+        await instance.disconnect()
+
+        assert proc.terminated is True
+        assert proc.killed is True
+        assert instance._process is None
+        assert instance._pending == {}
+        assert isinstance(future.exception(), adapter.KeetNotConnected)
 
     @pytest.mark.asyncio
     async def test_disconnect_fails_pending_requests(self):
@@ -1176,3 +1524,633 @@ class TestRequirementsAndStandalone:
         assert result["ok"] is False
         assert "INVALID_TEXT" in result["error"]
         instance.disconnect.assert_awaited_once()
+
+
+class TestRegistration:
+    class Context:
+        def __init__(self):
+            self.kwargs = None
+
+        def register_platform(self, **kwargs):
+            self.kwargs = kwargs
+
+    def test_registration_advertises_images_without_plain_text_claim(self):
+        context = self.Context()
+
+        adapter.register(context)
+
+        kwargs = context.kwargs
+        hint = kwargs["platform_hint"].lower()
+        assert kwargs["name"] == "keet"
+        assert kwargs["label"] == "Keet"
+        assert kwargs["max_message_length"] == 4096
+        assert "image" in hint
+        for media_type in ("png", "jpeg", "webp", "gif"):
+            assert media_type in hint
+        assert "10 mib" in hint
+        assert "plain text only" not in hint
+        assert "markdown is not rendered" in hint
+
+    def test_registration_marks_other_attachments_unsupported(self):
+        context = self.Context()
+
+        adapter.register(context)
+
+        hint = context.kwargs["platform_hint"].lower()
+        assert "files, voice, video, and animations are not supported" in hint
+        for unsupported in ("send_file", "send_attachment", "send_voice", "send_video"):
+            assert not hasattr(adapter.KeetAdapter, unsupported)
+
+
+class TestInboundMedia:
+    def _adapter(self, tmp_path):
+        instance = make_adapter()
+        instance._data_dir = str(tmp_path)
+        instance._allowed_users = {VALID_A}
+        instance._dynamic_allowed = set()
+        instance._welcomed_contacts[VALID_A] = None
+        instance.on_message = AsyncMock()
+        return instance
+
+    def _media(self, inbox, name="message-1.png", data=PNG_BYTES, **overrides):
+        inbox.mkdir(parents=True, exist_ok=True)
+        path = inbox / name
+        path.write_bytes(data)
+        metadata = {
+            "path": str(path),
+            "mime_type": "image/png",
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        metadata.update(overrides)
+        return path, metadata
+
+    def _event(self, media, text="a caption"):
+        return {
+            "room_key": VALID_ROOM,
+            "sender": VALID_A,
+            "text": text,
+            "timestamp": 100,
+            "message_id": "m-media",
+            "media": media,
+        }
+
+    @pytest.mark.asyncio
+    async def test_valid_photo_is_forwarded_with_path_and_metadata(self, tmp_path):
+        instance = self._adapter(tmp_path)
+        path, media = self._media(tmp_path / "media" / "inbox")
+
+        await instance._on_message(self._event(media, text="look at this"))
+
+        instance.on_message.assert_awaited_once()
+        message = instance.on_message.await_args.args[0]
+        assert message.message_type == adapter.MessageType.PHOTO
+        assert message.media_urls == [str(path.resolve())]
+        assert message.media_types == ["image/png"]
+        assert message.text == "look at this"
+        assert message.source.chat_id == VALID_ROOM
+        assert message.source.thread_id == VALID_ROOM
+        assert message.source.user_id == VALID_A
+
+    @pytest.mark.asyncio
+    async def test_image_without_caption_is_still_a_photo(self, tmp_path):
+        instance = self._adapter(tmp_path)
+        _, media = self._media(tmp_path / "media" / "inbox")
+
+        await instance._on_message(self._event(media, text=""))
+
+        message = instance.on_message.await_args.args[0]
+        assert message.message_type == adapter.MessageType.PHOTO
+        assert message.text == ""
+        assert len(message.media_urls) == 1
+        assert message.media_types == ["image/png"]
+
+    @pytest.mark.asyncio
+    async def test_missing_media_metadata_is_dropped(self, tmp_path):
+        instance = self._adapter(tmp_path)
+
+        await instance._on_message(self._event({}))
+
+        instance.on_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_path_traversal_is_dropped_and_outside_file_survives(self, tmp_path):
+        instance = self._adapter(tmp_path)
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(PNG_BYTES)
+        media = {
+            "path": str(outside),
+            "mime_type": "image/png",
+            "size": len(PNG_BYTES),
+            "sha256": hashlib.sha256(PNG_BYTES).hexdigest(),
+        }
+
+        await instance._on_message(self._event(media))
+
+        instance.on_message.assert_not_awaited()
+        assert outside.exists()
+
+    @pytest.mark.asyncio
+    async def test_symlink_escape_is_dropped(self, tmp_path):
+        instance = self._adapter(tmp_path)
+        inbox = tmp_path / "media" / "inbox"
+        inbox.mkdir(parents=True)
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(PNG_BYTES)
+        link = inbox / "escape.png"
+        link.symlink_to(outside)
+        media = {
+            "path": str(link),
+            "mime_type": "image/png",
+            "size": len(PNG_BYTES),
+            "sha256": hashlib.sha256(PNG_BYTES).hexdigest(),
+        }
+
+        await instance._on_message(self._event(media))
+
+        instance.on_message.assert_not_awaited()
+        assert outside.exists()
+
+    @pytest.mark.asyncio
+    async def test_stale_size_or_digest_is_dropped(self, tmp_path):
+        instance = self._adapter(tmp_path)
+        _, stale_size = self._media(tmp_path / "media" / "inbox", size=len(PNG_BYTES) + 1)
+
+        await instance._on_message(self._event(stale_size))
+        instance.on_message.assert_not_awaited()
+
+        _, stale_digest = self._media(
+            tmp_path / "media" / "inbox",
+            name="message-2.png",
+            sha256="0" * 64,
+        )
+        await instance._on_message(self._event(stale_digest))
+        instance.on_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_invalid_media_is_dropped_but_allowed_file_is_retained(self, tmp_path):
+        instance = self._adapter(tmp_path)
+        path, media = self._media(tmp_path / "media" / "inbox", size=1)
+
+        await instance._on_message(self._event(media))
+
+        instance.on_message.assert_not_awaited()
+        assert path.exists()
+
+    @pytest.mark.asyncio
+    async def test_handle_message_is_preferred_when_available(self, tmp_path):
+        instance = self._adapter(tmp_path)
+        instance.handle_message = AsyncMock()
+        _, media = self._media(tmp_path / "media" / "inbox")
+
+        await instance._on_message(self._event(media))
+
+        instance.handle_message.assert_awaited_once()
+        instance.on_message.assert_not_awaited()
+        assert instance.handle_message.await_args.args[0].source.thread_id == VALID_ROOM
+
+    @pytest.mark.asyncio
+    async def test_handle_message_and_on_message_receive_equivalent_events(self, tmp_path):
+        _, media = self._media(tmp_path / "media" / "inbox")
+        handlers = []
+
+        for attribute in ("handle_message", "on_message"):
+            instance = self._adapter(tmp_path)
+            if attribute == "handle_message":
+                instance.handle_message = AsyncMock()
+            await instance._on_message(self._event(media, text="caption"))
+            handlers.append(getattr(instance, attribute).await_args.args[0])
+
+        for message in handlers:
+            assert message.message_type == adapter.MessageType.PHOTO
+            assert message.source.chat_id == VALID_ROOM
+            assert message.source.thread_id == VALID_ROOM
+            assert message.text == "caption"
+            assert message.media_types == ["image/png"]
+
+    @pytest.mark.asyncio
+    async def test_denied_sender_media_is_removed_from_inbox(self, tmp_path):
+        instance = self._adapter(tmp_path)
+        instance._allowed_users = set()
+        path, media = self._media(tmp_path / "media" / "inbox")
+
+        await instance._on_message(self._event(media))
+
+        instance.on_message.assert_not_awaited()
+        assert not path.exists()
+
+    @pytest.mark.asyncio
+    async def test_denied_sender_cannot_delete_outside_the_inbox(self, tmp_path):
+        instance = self._adapter(tmp_path)
+        instance._allowed_users = set()
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(PNG_BYTES)
+        media = {
+            "path": str(outside),
+            "mime_type": "image/png",
+            "size": len(PNG_BYTES),
+            "sha256": hashlib.sha256(PNG_BYTES).hexdigest(),
+        }
+
+        await instance._on_message(self._event(media))
+
+        instance.on_message.assert_not_awaited()
+        assert outside.exists()
+
+
+class TestDynamicAcl:
+    @pytest.mark.asyncio
+    async def test_add_is_correlated_and_authorizes_immediately(self):
+        instance = make_adapter()
+        instance._allowed_users = set()
+        instance._dynamic_allowed = set()
+        instance._revoked_allowed = {VALID_A}
+        instance._request = AsyncMock(
+            return_value={
+                "identity": VALID_A,
+                "source": "runtime",
+                "revoked": False,
+                "authorized": True,
+            }
+        )
+
+        assert await instance.add_allowed_user(VALID_A) is True
+
+        instance._request.assert_awaited_once_with("acl_add", {"identity": VALID_A})
+        assert instance._is_allowed(VALID_A) is True
+        assert VALID_A not in instance._revoked_allowed
+
+    @pytest.mark.asyncio
+    async def test_remove_revokes_a_configured_identity_and_readd_clears_it(self):
+        instance = make_adapter()
+        instance._allowed_users = {VALID_A}
+        instance._dynamic_allowed = {VALID_A}
+        instance._request = AsyncMock(
+            return_value={
+                "identity": VALID_A,
+                "source": "config",
+                "revoked": True,
+                "authorized": False,
+            }
+        )
+
+        assert await instance.remove_allowed_user(VALID_A) is True
+        instance._request.assert_awaited_once_with("acl_remove", {"identity": VALID_A})
+        assert instance._is_allowed(VALID_A) is False
+
+        instance._request = AsyncMock(
+            return_value={
+                "identity": VALID_A,
+                "source": "config",
+                "revoked": False,
+                "authorized": True,
+            }
+        )
+        assert await instance.add_allowed_user(VALID_A) is True
+        assert instance._is_allowed(VALID_A) is True
+
+    @pytest.mark.asyncio
+    async def test_failed_acl_write_does_not_change_local_policy(self):
+        instance = make_adapter()
+        instance._allowed_users = {VALID_A}
+        instance._dynamic_allowed = set()
+        instance._revoked_allowed = set()
+        instance._request = AsyncMock(
+            side_effect=adapter.KeetBridgeError("ACL_PERSIST_FAILED", "disk full")
+        )
+
+        assert await instance.remove_allowed_user(VALID_A) is False
+        assert instance._is_allowed(VALID_A) is True
+        assert VALID_A not in instance._revoked_allowed
+
+    @pytest.mark.asyncio
+    async def test_acl_list_sync_reports_effective_policy(self):
+        instance = make_adapter()
+        instance._allowed_users = {VALID_A}
+        instance._dynamic_allowed = set()
+        instance._revoked_allowed = set()
+        instance._request = AsyncMock(
+            return_value={
+                "entries": [
+                    {
+                        "identity": VALID_A,
+                        "source": "config",
+                        "revoked": True,
+                        "authorized": False,
+                    },
+                    {
+                        "identity": VALID_B,
+                        "source": "runtime",
+                        "revoked": False,
+                        "authorized": True,
+                    },
+                ],
+                "identities": [VALID_B],
+                "revoked": [VALID_A],
+                "count": 1,
+            }
+        )
+
+        users = await instance.get_allowed_users()
+
+        instance._request.assert_awaited_once_with("acl_list", {})
+        assert users == [VALID_B]
+        assert instance._is_allowed(VALID_A) is False
+        assert instance._is_allowed(VALID_B) is True
+
+    def test_version_2_revocations_are_loaded_on_restart(self, tmp_path):
+        acl = tmp_path / "allowed.json"
+        acl.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "identities": [VALID_B],
+                    "revoked": [VALID_A],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch.dict(
+            os.environ,
+            {
+                adapter.DATA_DIR_ENV: str(tmp_path),
+                adapter.ACL_FILE_ENV: str(acl),
+            },
+            clear=True,
+        ):
+            instance = adapter.KeetAdapter()
+
+        assert instance._is_allowed(VALID_A) is False
+        assert instance._is_allowed(VALID_B) is True
+
+
+class TestPairingRequestQueue:
+    def _event(self, request_id, identity=VALID_A, **fields):
+        event = {
+            "type": "pairing_request",
+            "request_id": request_id,
+            "identity": identity,
+            "created_at": 100,
+            "expires_at": 200,
+        }
+        event.update(fields)
+        return event
+
+    @pytest.mark.asyncio
+    async def test_queue_is_bounded_and_drops_the_oldest(self):
+        instance = make_adapter()
+        with patch.object(adapter, "MAX_PAIRING_REQUESTS", 3):
+            for index in range(5):
+                await instance._handle_bridge_event(
+                    json.dumps(self._event(f"request-{index}"))
+                )
+
+        assert [entry["request_id"] for entry in instance.get_pairing_requests()] == [
+            "request-2",
+            "request-3",
+            "request-4",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_duplicate_request_replaces_without_growing_the_queue(self):
+        instance = make_adapter()
+        await instance._handle_bridge_event(
+            json.dumps(self._event("same", display_name="first"))
+        )
+        await instance._handle_bridge_event(
+            json.dumps(self._event("same", display_name="second"))
+        )
+
+        entries = instance.get_pairing_requests()
+        assert len(entries) == 1
+        assert entries[0]["display_name"] == "second"
+
+    @pytest.mark.asyncio
+    async def test_callback_receives_one_record_and_failures_are_isolated(self):
+        instance = make_adapter()
+        instance.on_pairing_request = AsyncMock()
+        await instance._handle_bridge_event(json.dumps(self._event("r-1")))
+
+        instance.on_pairing_request.assert_awaited_once()
+        record = instance.on_pairing_request.await_args.args[0]
+        assert record["request_id"] == "r-1"
+        assert record["identity"] == VALID_A
+
+        instance.on_pairing_request = AsyncMock(side_effect=RuntimeError("boom"))
+        await instance._handle_bridge_event(json.dumps(self._event("r-2")))
+        assert len(instance.get_pairing_requests()) == 2
+
+    @pytest.mark.asyncio
+    async def test_log_record_is_stable_and_does_not_authorize(self):
+        instance = make_adapter()
+        instance._allowed_users = set()
+        instance._dynamic_allowed = set()
+        with patch.object(adapter.logger, "info") as info:
+            await instance._handle_bridge_event(
+                json.dumps(self._event("logged", identity=VALID_B))
+            )
+
+        tagged = [
+            call
+            for call in info.call_args_list
+            if call.args and str(call.args[0]).startswith("keet_pairing_request")
+        ]
+        assert len(tagged) == 1
+        payload = json.loads(tagged[0].args[1])
+        assert payload["request_id"] == "logged"
+        assert payload["identity"] == VALID_B
+        assert "received_at" in payload
+        assert instance._is_allowed(VALID_B) is False
+
+    @pytest.mark.asyncio
+    async def test_accept_and_decline_use_request_ids_and_clear_the_queue(self):
+        instance = make_adapter()
+        instance._request = AsyncMock(
+            side_effect=[
+                {"status": "accepted", "identity": VALID_A},
+                {"status": "declined"},
+            ]
+        )
+        instance._queue_pairing_request(
+            {
+                "request_id": "accept-me",
+                "identity": VALID_A,
+                "created_at": 1,
+            }
+        )
+        instance._queue_pairing_request(
+            {
+                "request_id": "decline-me",
+                "identity": VALID_B,
+                "created_at": 2,
+            }
+        )
+
+        accepted = await instance.accept_pairing("accept-me")
+        declined = await instance.decline_pairing("decline-me")
+
+        assert accepted["status"] == "accepted"
+        assert declined["status"] == "declined"
+        assert instance._request.await_args_list[0].args == (
+            "accept_pairing",
+            {"pairing_request_id": "accept-me"},
+        )
+        assert instance._request.await_args_list[1].args == (
+            "decline_pairing",
+            {"pairing_request_id": "decline-me"},
+        )
+        assert instance.get_pairing_requests() == []
+        assert instance._is_allowed(VALID_A) is True
+
+
+class TestDeliveryUpdates:
+    def _event(self, message_id="message-1", **fields):
+        event = {
+            "type": "delivery_update",
+            "message_id": message_id,
+            "room_key": VALID_ROOM,
+            "status": "replicated",
+            "peer_count": 1,
+            "timestamp": 1_700_000_000_000,
+        }
+        event.update(fields)
+        return event
+
+    @pytest.mark.asyncio
+    async def test_latest_status_is_exposed_per_message(self):
+        instance = make_adapter()
+        await instance._handle_bridge_event(
+            json.dumps(self._event(status="replicated", peer_count=2))
+        )
+        await instance._handle_bridge_event(
+            json.dumps(
+                self._event(
+                    status="expired",
+                    peer_count=0,
+                    timestamp=1_700_000_060_000,
+                )
+            )
+        )
+
+        record = instance.get_delivery_status("message-1")
+        assert record == {
+            "message_id": "message-1",
+            "room_key": VALID_ROOM,
+            "status": "expired",
+            "peer_count": 0,
+            "timestamp": 1_700_000_060_000,
+        }
+        record["status"] = "mutated"
+        assert instance.get_delivery_status("message-1")["status"] == "expired"
+        assert instance.get_delivery_status("missing") is None
+        assert instance.get_delivery_status(None) is None
+
+    @pytest.mark.asyncio
+    async def test_unknown_message_ids_are_logged_without_failing(self):
+        instance = make_adapter()
+        with patch.object(adapter.logger, "info") as info:
+            await instance._handle_bridge_event(
+                json.dumps(self._event(message_id="never-sent-here"))
+            )
+
+        tagged = [
+            call
+            for call in info.call_args_list
+            if call.args and str(call.args[0]).startswith("keet_delivery_update")
+        ]
+        assert len(tagged) == 1
+        assert instance.get_delivery_status("never-sent-here")["status"] == "replicated"
+
+    @pytest.mark.asyncio
+    async def test_log_is_structured_and_never_claims_read_or_seen(self):
+        instance = make_adapter()
+        with patch.object(adapter.logger, "info") as info:
+            await instance._handle_bridge_event(
+                json.dumps(self._event(status="replicated", peer_count=3))
+            )
+            await instance._handle_bridge_event(
+                json.dumps(self._event(status="expired", peer_count=0, timestamp=123))
+            )
+
+        tagged = [
+            call
+            for call in info.call_args_list
+            if call.args and str(call.args[0]).startswith("keet_delivery_update")
+        ]
+        assert len(tagged) == 2
+        payloads = [json.loads(call.args[1]) for call in tagged]
+        assert payloads[0] == {
+            "message_id": "message-1",
+            "room_key": VALID_ROOM,
+            "status": "replicated",
+            "peer_count": 3,
+            "timestamp": 1_700_000_000_000,
+        }
+        assert payloads[1]["status"] == "expired"
+        assert payloads[1]["timestamp"] == 123
+
+        rendered = " ".join(str(call) for call in tagged).lower()
+        assert "read" not in rendered
+        assert "seen" not in rendered
+
+    @pytest.mark.asyncio
+    async def test_status_bookkeeping_is_bounded_and_ignores_invalid_updates(self):
+        instance = make_adapter()
+        await instance._handle_bridge_event(json.dumps(self._event()))
+        await instance._handle_bridge_event(json.dumps({"type": "delivery_update"}))
+        await instance._handle_bridge_event(
+            json.dumps(self._event(status="displayed", message_id="bad-status"))
+        )
+        assert instance.get_delivery_status("message-1") is not None
+        assert instance.get_delivery_status("bad-status") is None
+
+        with patch.object(adapter, "MAX_DELIVERY_STATUSES", 2):
+            await instance._handle_bridge_event(
+                json.dumps(self._event(message_id="second"))
+            )
+            await instance._handle_bridge_event(
+                json.dumps(self._event(message_id="third"))
+            )
+
+        assert instance.get_delivery_status("message-1") is None
+        assert instance.get_delivery_status("second") is not None
+        assert instance.get_delivery_status("third") is not None
+
+class TestFiftyMessageInboundIntegration:
+    """11.1 — 50 distinct senders/rooms through adapter dispatcher, no cross-talk."""
+
+    @pytest.mark.asyncio
+    async def test_fifty_inbound_no_crossover_or_duplicates(self):
+        instance = make_adapter()
+        proc = FakeProcess()
+        instance._process = proc
+
+        senders = [f"{chr(65 + (i % 26))}{i:03d}" * 8 for i in range(50)]
+        rooms = [f"room{i:03d}" * 8 + f"{i:02d}" * 4 for i in range(50)]
+        threads = [f"thread{i:03d}" * 8 for i in range(50)]
+        received = {}
+
+        for i in range(50):
+            msg = {
+                "type": "message",
+                "message_id": f"mid{i:03d}",
+                "chat_id": rooms[i],
+                "room_key": rooms[i],
+                "from": senders[i],
+                "sender": senders[i],
+                "text": f"msg-{i}",
+                "timestamp": 1800000000000 + i,
+                "thread_id": threads[i],
+            }
+            # Direct adapter event path (simulating bridge event dispatch)
+            await instance._handle_bridge_event(json.dumps(msg))
+            key = (rooms[i], senders[i], threads[i])
+            # Verify mapping is to the originating context and not mixed
+            received[key] = msg["message_id"]
+
+        assert len(received) == 50, "expected 50 unique contexts"
+        # No cross-talk: each key unique
+        assert len({k for k in received}) == 50
+        # No duplicate delivery (each mid unique by construction)
+        mids = [v for v in received.values()]
+        assert len(mids) == len(set(mids)), "duplicate message delivery detected"

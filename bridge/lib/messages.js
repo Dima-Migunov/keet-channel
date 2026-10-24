@@ -5,12 +5,14 @@ const c = require('compact-encoding')
 const crypto = require('hypercore-crypto')
 
 const MESSAGE_VERSION = 1
+const MEDIA_MESSAGE_VERSION = 2
 const MAX_TEXT_BYTES = 4096
 const DEFAULT_SEEN_LIMIT = 10000
 const SIGNATURE_BYTES = 64
 
 const { createErrorClass } = require('./errors')
 const { KEY_BYTES, normalizeKey: normalizeProtocolKey } = require('./keys')
+const { MAX_MEDIA_BYTES, validateMedia } = require('./media')
 
 const MessageError = createErrorClass('MessageError')
 
@@ -122,6 +124,77 @@ const textEncoding = {
   }
 }
 
+/**
+ * Normalize a media descriptor into the exact signed shape. Validation is
+ * shared with the inbox policy so an invalid payload is rejected the same way
+ * whether it arrives through a command, a message, or a file.
+ */
+function normalizeMedia (media) {
+  if (!media || typeof media !== 'object' || Array.isArray(media)) {
+    throw new MessageError('INVALID_MEDIA', 'media must be an object')
+  }
+
+  try {
+    const validated = validateMedia(media)
+    return {
+      mimeType: validated.mimeType,
+      size: validated.size,
+      sha256: validated.sha256,
+      bytes: validated.bytes
+    }
+  } catch (err) {
+    if (err instanceof MessageError) throw err
+    throw new MessageError(err.code || 'INVALID_MEDIA', err.message, err)
+  }
+}
+
+const mediaEncoding = {
+  preencode (state, media) {
+    const normalized = normalizeMedia(media)
+    c.string.preencode(state, normalized.mimeType)
+    c.uint.preencode(state, normalized.size)
+    c.fixed32.preencode(state, b4a.from(normalized.sha256, 'hex'))
+    c.uint.preencode(state, normalized.bytes.byteLength)
+    state.end += normalized.bytes.byteLength
+  },
+  encode (state, media) {
+    const normalized = normalizeMedia(media)
+    c.string.encode(state, normalized.mimeType)
+    c.uint.encode(state, normalized.size)
+    c.fixed32.encode(state, b4a.from(normalized.sha256, 'hex'))
+    c.uint.encode(state, normalized.bytes.byteLength)
+    state.buffer.set(normalized.bytes, state.start)
+    state.start += normalized.bytes.byteLength
+  },
+  decode (state) {
+    const mimeType = c.string.decode(state)
+    const size = c.uint.decode(state)
+    const sha256 = c.fixed32.decode(state).toString('hex')
+    const length = c.uint.decode(state)
+
+    if (length > MAX_MEDIA_BYTES) {
+      throw new MessageError('MEDIA_TOO_LARGE', `media must be at most ${MAX_MEDIA_BYTES} bytes`)
+    }
+    if (state.end - state.start < length) {
+      throw new MessageError('TRUNCATED', 'message media is truncated')
+    }
+
+    const bytes = b4a.from(state.buffer.subarray(state.start, (state.start += length)))
+
+    try {
+      const validated = validateMedia({ mimeType, size, sha256, bytes })
+      return {
+        mimeType: validated.mimeType,
+        size: validated.size,
+        sha256: validated.sha256,
+        bytes: validated.bytes
+      }
+    } catch (err) {
+      throw new MessageError(err.code || 'INVALID_MEDIA', err.message, err)
+    }
+  }
+}
+
 const messageBody = {
   preencode (state, message) {
     c.uint.preencode(state, message.version)
@@ -130,6 +203,9 @@ const messageBody = {
     c.fixed32.preencode(state, normalizeKey(message.sender, 'sender'))
     c.uint64.preencode(state, validateTimestamp(message.timestamp))
     textEncoding.preencode(state, message.text)
+    if (message.version === MEDIA_MESSAGE_VERSION) {
+      mediaEncoding.preencode(state, message.media)
+    }
   },
   encode (state, message) {
     c.uint.encode(state, message.version)
@@ -138,18 +214,21 @@ const messageBody = {
     c.fixed32.encode(state, normalizeKey(message.sender, 'sender'))
     c.uint64.encode(state, validateTimestamp(message.timestamp))
     textEncoding.encode(state, message.text)
+    if (message.version === MEDIA_MESSAGE_VERSION) {
+      mediaEncoding.encode(state, message.media)
+    }
   },
   decode (state) {
     const version = c.uint.decode(state)
 
-    if (version !== MESSAGE_VERSION) {
+    if (version !== MESSAGE_VERSION && version !== MEDIA_MESSAGE_VERSION) {
       throw new MessageError(
         'UNSUPPORTED_VERSION',
         `unsupported message version ${version}`
       )
     }
 
-    return {
+    const message = {
       version,
       roomKey: c.fixed32.decode(state),
       messageId: c.fixed32.decode(state),
@@ -158,6 +237,12 @@ const messageBody = {
       text: textEncoding.decode(state),
       signature: null
     }
+
+    if (version === MEDIA_MESSAGE_VERSION) {
+      message.media = mediaEncoding.decode(state)
+    }
+
+    return message
   }
 }
 
@@ -173,25 +258,48 @@ function wrapDecodeError (err) {
   return new MessageError('INVALID_MESSAGE', 'message could not be decoded')
 }
 
+function messageVersion (message) {
+  if (message.version !== undefined) return message.version
+  return message.media === undefined || message.media === null
+    ? MESSAGE_VERSION
+    : MEDIA_MESSAGE_VERSION
+}
+
+function assertVersion (version) {
+  if (version !== MESSAGE_VERSION && version !== MEDIA_MESSAGE_VERSION) {
+    throw new MessageError('UNSUPPORTED_VERSION', `unsupported message version ${version}`)
+  }
+}
+
 function encodeMessageBody (message) {
   if (!message || typeof message !== 'object') {
     throw new MessageError('INVALID_MESSAGE', 'message must be an object')
   }
 
-  const version = message.version === undefined ? MESSAGE_VERSION : message.version
+  const version = messageVersion(message)
+  assertVersion(version)
 
-  if (version !== MESSAGE_VERSION) {
-    throw new MessageError('UNSUPPORTED_VERSION', `unsupported message version ${version}`)
+  const hasMedia = message.media !== undefined && message.media !== null
+
+  if (version === MESSAGE_VERSION && hasMedia) {
+    throw new MessageError('INVALID_MESSAGE', 'version 1 messages cannot carry media')
+  }
+  if (version === MEDIA_MESSAGE_VERSION && !hasMedia) {
+    throw new MessageError('INVALID_MEDIA', 'version 2 messages require a media descriptor')
   }
 
-  return c.encode(messageBody, {
+  const body = {
     version,
     roomKey: message.roomKey,
     messageId: message.messageId,
     sender: message.sender,
     timestamp: message.timestamp,
     text: message.text
-  })
+  }
+
+  if (hasMedia) body.media = normalizeMedia(message.media)
+
+  return c.encode(messageBody, body)
 }
 
 function signMessage (message, signer) {
@@ -202,27 +310,36 @@ function signMessage (message, signer) {
     throw new MessageError('SIGNER_MISMATCH', 'signer does not match message sender')
   }
 
+  const version = messageVersion(message)
+  assertVersion(version)
+
+  const hasMedia = message.media !== undefined && message.media !== null
+
+  if (version === MESSAGE_VERSION && hasMedia) {
+    throw new MessageError('INVALID_MESSAGE', 'version 1 messages cannot carry media')
+  }
+  if (version === MEDIA_MESSAGE_VERSION && !hasMedia) {
+    throw new MessageError('INVALID_MEDIA', 'version 2 messages require a media descriptor')
+  }
+
   const roomKey = normalizeKey(message.roomKey, 'roomKey')
   const messageId = normalizeKey(message.messageId, 'messageId')
   const timestamp = validateTimestamp(message.timestamp)
-  const body = encodeMessageBody({
-    version: MESSAGE_VERSION,
+  const signed = {
+    version,
     roomKey,
     messageId,
     sender,
     timestamp,
     text: message.text
-  })
-
-  return {
-    version: MESSAGE_VERSION,
-    roomKey,
-    messageId,
-    sender,
-    timestamp,
-    text: message.text,
-    signature: crypto.sign(body, keyPair.secretKey)
   }
+
+  if (hasMedia) signed.media = normalizeMedia(message.media)
+
+  const body = encodeMessageBody(signed)
+  signed.signature = crypto.sign(body, keyPair.secretKey)
+
+  return signed
 }
 
 function createMessage (fields, signer) {
@@ -231,8 +348,12 @@ function createMessage (fields, signer) {
   }
 
   const keyPair = resolveKeyPair(signer)
+  const hasMedia = fields.media !== undefined && fields.media !== null
+  const version = fields.version === undefined
+    ? (hasMedia ? MEDIA_MESSAGE_VERSION : MESSAGE_VERSION)
+    : fields.version
   const message = {
-    version: MESSAGE_VERSION,
+    version,
     roomKey: fields.roomKey,
     messageId:
       fields.messageId === undefined ? crypto.randomBytes(KEY_BYTES) : fields.messageId,
@@ -241,22 +362,29 @@ function createMessage (fields, signer) {
     text: fields.text
   }
 
+  if (hasMedia) message.media = fields.media
+
   return signMessage(message, keyPair)
 }
 
 function verifyMessage (message) {
   const signature = normalizeSignature(message && message.signature)
   const sender = normalizeKey(message.sender, 'sender')
-  const body = encodeMessageBody({
-    version: message.version,
+  const version = messageVersion(message)
+  const body = {
+    version,
     roomKey: message.roomKey,
     messageId: message.messageId,
     sender,
     timestamp: message.timestamp,
     text: message.text
-  })
+  }
 
-  return crypto.verify(body, signature, sender)
+  if (message.media !== undefined && message.media !== null) {
+    body.media = message.media
+  }
+
+  return crypto.verify(encodeMessageBody(body), signature, sender)
 }
 
 function encodeMessage (message) {
@@ -265,9 +393,31 @@ function encodeMessage (message) {
   return b4a.concat([body, signature])
 }
 
+function peekVersion (buffer) {
+  try {
+    const state = c.state(0, buffer.byteLength, buffer)
+    return c.uint.decode(state)
+  } catch {
+    throw new MessageError('TRUNCATED', 'message is truncated or malformed')
+  }
+}
+
 function decodeMessage (buffer, opts = {}) {
   if (!b4a.isBuffer(buffer) && !(buffer instanceof Uint8Array)) {
     throw new MessageError('INVALID_MESSAGE', 'message must be a buffer')
+  }
+
+  // Reject an unknown version before interpreting any other field. Callers
+  // that only understand version 1 can pass `version: 1` to get the same
+  // safe rejection without parsing a version-2 media payload.
+  const version = peekVersion(buffer)
+  assertVersion(version)
+
+  if (opts.version !== undefined && opts.version !== version) {
+    throw new MessageError(
+      'UNSUPPORTED_VERSION',
+      `unsupported message version ${version}`
+    )
   }
 
   const expectedRoomKey =
@@ -369,6 +519,7 @@ class MessageReceiver {
 
 module.exports = {
   MESSAGE_VERSION,
+  MEDIA_MESSAGE_VERSION,
   MAX_TEXT_BYTES,
   DEFAULT_SEEN_LIMIT,
   MessageError,

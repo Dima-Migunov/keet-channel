@@ -15,6 +15,7 @@ const {
   decodeMessage,
   MessageDeduplicator
 } = require('./messages')
+const { MediaStore } = require('./media')
 const {
   StorageError,
   dataPaths,
@@ -353,6 +354,8 @@ class Room extends EventEmitter {
     this._membersDirty = false
     this._pendingMessages = new Set()
     this._seen = new MessageDeduplicator()
+    this.mediaStore = opts.mediaStore || null
+    this._ownsMediaStore = opts.mediaStore === undefined || opts.mediaStore === null
     this._swarm = null
     this._discovery = null
     this._onConnection = null
@@ -420,7 +423,8 @@ class Room extends EventEmitter {
       paths,
       identity: opts.identity,
       roomKey,
-      encryptionKey
+      encryptionKey,
+      mediaStore: opts.mediaStore || new MediaStore({ dataDir, env: opts.env })
     })
 
     try {
@@ -436,6 +440,10 @@ class Room extends EventEmitter {
   }
 
   async _open () {
+    if (this.mediaStore !== null) {
+      await this.mediaStore.open()
+    }
+
     this.store = new Corestore(this.paths.corestoreDir)
     this.session = this.store.session()
 
@@ -640,21 +648,74 @@ class Room extends EventEmitter {
             continue
           }
 
+          if (this._seen.has(message.messageId)) {
+            this._log('discarding duplicate message')
+            continue
+          }
+
+          let storedMedia = null
+
+          if (message.media !== undefined) {
+            if (this.mediaStore === null) {
+              this._log('discarding message with media but no media store')
+              continue
+            }
+
+            try {
+              const stored = await this.mediaStore.store({
+                messageId,
+                mimeType: message.media.mimeType,
+                size: message.media.size,
+                sha256: message.media.sha256,
+                bytes: message.media.bytes
+              })
+              const verified = await this.mediaStore.verify({
+                path: stored.path,
+                mimeType: stored.mimeType,
+                size: stored.size,
+                sha256: stored.sha256
+              })
+
+              storedMedia = {
+                path: verified.path,
+                mime_type: verified.mimeType,
+                size: verified.size,
+                sha256: verified.sha256
+              }
+            } catch (err) {
+              this._log('discarding message with unstorable media', err)
+              continue
+            }
+          }
+
           try {
             await view.messages.append(decoded.message)
           } catch (err) {
+            if (storedMedia !== null) {
+              try {
+                await this.mediaStore.remove(storedMedia.path)
+              } catch (removeErr) {
+                this._log('failed to remove media for a rejected message', removeErr)
+              }
+            }
             this._log('failed to append message to the room view', err)
             continue
           }
 
           if (this._seen.add(message.messageId)) {
-            this.emit('message', {
+            const event = {
               messageId,
               roomKey: this.keyHex,
               sender: message.sender.toString('hex'),
               timestamp: message.timestamp,
               text: message.text
-            })
+            }
+
+            if (storedMedia !== null) {
+              event.media = storedMedia
+            }
+
+            this.emit('message', event)
           }
         } finally {
           // The entry has been observed, whether it was accepted or rejected,
@@ -761,15 +822,18 @@ class Room extends EventEmitter {
       throw new RoomError('NOT_WRITABLE', 'This bridge is not an authorized writer in the room')
     }
 
-    const message = createMessage(
-      {
-        roomKey: this.key,
-        text,
-        timestamp: opts.timestamp,
-        messageId: opts.messageId
-      },
-      this.identity
-    )
+    const fields = {
+      roomKey: this.key,
+      text,
+      timestamp: opts.timestamp,
+      messageId: opts.messageId
+    }
+
+    if (opts.media !== undefined && opts.media !== null) {
+      fields.media = opts.media
+    }
+
+    const message = createMessage(fields, this.identity)
     const messageId = message.messageId.toString('hex')
 
     this._pendingMessages.add(messageId)
@@ -807,6 +871,7 @@ class Room extends EventEmitter {
 
     const onConnection = (connection) => {
       this._replicate(connection)
+      this.emit('peer', { peerCount: this.peerCount })
     }
 
     let discovery = null
@@ -899,6 +964,15 @@ class Room extends EventEmitter {
     this._swarm = null
     this._discovery = null
     this._onConnection = null
+
+    if (this._ownsMediaStore && this.mediaStore !== null) {
+      try {
+        await this.mediaStore.close()
+      } catch (err) {
+        this._log('failed to close the media store', err)
+      }
+      this.mediaStore = null
+    }
   }
 }
 

@@ -1,0 +1,44 @@
+{
+  "started_at": "2026-10-24T06:16:25.321Z",
+  "finished_at": "2026-10-24T06:16:45.407Z",
+  "duration_requested_s": 10,
+  "duration_elapsed_s": 12,
+  "interval_s": 1,
+  "data_dir": "/tmp/keet-soak-FJNVmy",
+  "bridge_pid": 160221,
+  "ready": true,
+  "pass": true,
+  "exit_code": 0,
+  "failures": [],
+  "thresholds": {
+    "rss_limit_mb": 512,
+    "rss_growth_mb": 256,
+    "fd_limit": 256,
+    "max_queued": 16,
+    "max_delivery": 64,
+    "max_media_active": 2,
+    "max_inbox": 512
+  },
+  "summary": {
+    "samples": 11,
+    "baseline_rss_mb": 97.3,
+    "peak_rss_mb": 98.8,
+    "rss_growth_mb": 1.5,
+    "baseline_open_fds": 31,
+    "peak_open_fds": 31,
+    "fds_growth": 0,
+    "peak_queued_messages": 0,
+    "peak_media_active": 0,
+    "peak_delivery_pending": 0,
+    "peak_inbox_files": 0
+  },
+  "stderr_tail": [
+    "[bridge] starting (data directory: /tmp/keet-soak-FJNVmy)",
+    "[bridge] identity f0d1e5c223bae5868149aaf354517c4b2176e1bf68e708e5f7bb5869cf263b8f",
+    "[bridge] room ff160d77dad5bdf2472b4376ed71e412433e40e5a39ee33ea18ce1dd88d288e7 (writer ff160d77dad5bdf2472b4376ed71e412433e40e5a39ee33ea18ce1dd88d288e7)",
+    "[bridge] invite keet://chat/yfo71467iwcicgdk18tca3b8yx731m1gmb36xn49ithjxs11ba16ak9i95md5niqd1uyybstrizxi7twaqdceropwtrpou49ommgkp3sb6kezgbetmkkcftg5bx1p8j7igdbwxtoftfrsq5rgdk36fk54xd45ta",
+    "[stdio] JSON stdio protocol ready",
+    "[bridge] shutting down",
+    "[bridge] stopped"
+  ]
+}
