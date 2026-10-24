@@ -11,3 +11,5 @@ pear-cache/
 bridge/data/
 repos/
 repos/
+__pycache__/
+*.pyc
